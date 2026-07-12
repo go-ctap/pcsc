@@ -15,18 +15,21 @@ import (
 )
 
 const (
-	scardScopeSystem       = 2
-	scardShareShared       = 2
-	scardLeaveCard         = 0
-	scardProtocolAny       = uint32(ProtocolT0 | ProtocolT1)
-	scardEInsufficientBuf  = uint32(0x80100008)
-	defaultResponseBufSize = 4096
-	maxResponseBufSize     = 65538
+	scardScopeSystem      = 2
+	scardShareShared      = 2
+	scardLeaveCard        = 0
+	scardProtocolAny      = uint32(ProtocolT0 | ProtocolT1)
+	scardEInsufficientBuf = uint32(0x80100008)
+	maxResponseBufSize    = 65538
 )
 
+type scardHandle = uintptr
+type scardDWORD = uint32
+type scardResult = uint32
+
 type scardIORequest struct {
-	Protocol uint32
-	Length   uint32
+	Protocol scardDWORD
+	Length   scardDWORD
 }
 
 var (
@@ -40,9 +43,17 @@ var (
 	procSCardTransmit         = modWinSCard.NewProc("SCardTransmit")
 )
 
-func callCode(proc *windows.LazyProc, args ...uintptr) int32 {
+var scardTransmit = func(handle scardHandle, sendPCI *scardIORequest, sendBuffer uintptr, sendLength scardDWORD, recvPCI *scardIORequest, recvBuffer uintptr, recvLength *scardDWORD) scardResult {
+	code := callCode(procSCardTransmit, handle, uintptr(unsafe.Pointer(sendPCI)), sendBuffer, uintptr(sendLength), uintptr(unsafe.Pointer(recvPCI)), recvBuffer, uintptr(unsafe.Pointer(recvLength)))
+	runtime.KeepAlive(sendPCI)
+	runtime.KeepAlive(recvPCI)
+	runtime.KeepAlive(recvLength)
+	return code
+}
+
+func callCode(proc *windows.LazyProc, args ...uintptr) uint32 {
 	r, _, _ := proc.Call(args...)
-	return int32(uint32(r))
+	return uint32(r)
 }
 
 func establishContext() (uintptr, error) {
@@ -157,24 +168,17 @@ func (c *card) Transmit(apdu []byte) ([]byte, error) {
 		return nil, errors.New("pcsc: card closed")
 	}
 
-	request := scardIORequest{Protocol: uint32(c.protocol), Length: uint32(unsafe.Sizeof(scardIORequest{}))}
-	response := make([]byte, defaultResponseBufSize)
+	request := scardIORequest{Protocol: scardDWORD(c.protocol), Length: scardDWORD(unsafe.Sizeof(scardIORequest{}))}
+	response := make([]byte, maxResponseBufSize)
+	size := scardDWORD(len(response))
+	code := scardTransmit(c.handle, &request, uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), scardDWORD(len(apdu)), nil, uintptr(unsafe.Pointer(unsafe.SliceData(response))), &size)
+	runtime.KeepAlive(apdu)
 
-	for {
-		size := uint32(len(response))
-		code := callCode(procSCardTransmit, c.handle, uintptr(unsafe.Pointer(&request)), uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), uintptr(len(apdu)), 0, uintptr(unsafe.Pointer(unsafe.SliceData(response))), uintptr(unsafe.Pointer(&size)))
-		runtime.KeepAlive(apdu)
-
-		if uint32(code) != scardEInsufficientBuf {
-			return bytes.Clone(response[:min(int(size), len(response))]), pcscError("SCardTransmit", code)
-		}
-
-		if size <= uint32(len(response)) || size > maxResponseBufSize {
-			return nil, pcscError("SCardTransmit", code)
-		}
-
-		response = make([]byte, size)
+	if err := pcscError("SCardTransmit", uint32(code)); err != nil {
+		return nil, err
 	}
+
+	return bytes.Clone(response[:min(int(size), len(response))]), nil
 }
 
 func (c *card) Status() (*CardStatus, error) {

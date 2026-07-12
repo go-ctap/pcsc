@@ -49,11 +49,11 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("pcsc: %s failed (0x%08x)", e.Op, e.Code)
 }
 
-func pcscError(op string, code int32) error {
+func pcscError(op string, code uint32) error {
 	if code == 0 {
 		return nil
 	}
-	return &Error{Op: op, Code: uint32(code)}
+	return &Error{Op: op, Code: code}
 }
 
 func errorName(code uint32) string {
