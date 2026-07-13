@@ -1,6 +1,7 @@
 package pcsc
 
 import (
+	"context"
 	"fmt"
 	"iter"
 )
@@ -28,10 +29,16 @@ type CardStatus struct {
 	ATR      []byte
 }
 
+type transmitResult struct {
+	response []byte
+	err      error
+}
+
 // Card is a connection to a smart card. Transmit sends one raw APDU and returns
-// the complete response, including SW1/SW2.
+// the complete response, including SW1/SW2. Cancellation is best-effort: a
+// driver may continue an in-flight APDU after Transmit returns ctx.Err().
 type Card interface {
-	Transmit(apdu []byte) ([]byte, error)
+	Transmit(ctx context.Context, apdu []byte) ([]byte, error)
 	Status() (*CardStatus, error)
 	Close() error
 }
@@ -58,6 +65,8 @@ func pcscError(op string, code uint32) error {
 
 func errorName(code uint32) string {
 	switch code {
+	case 0x80100002:
+		return "cancelled"
 	case 0x80100008:
 		return "insufficient buffer"
 	case 0x80100009:

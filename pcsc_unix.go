@@ -4,6 +4,7 @@ package pcsc
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"iter"
 	"runtime"
@@ -35,6 +36,7 @@ var (
 	scardDisconnect       func(scardHandle, scardDWORD) scardResult
 	scardStatus           func(scardHandle, uintptr, *scardDWORD, *scardDWORD, *scardDWORD, uintptr, *scardDWORD) scardResult
 	scardTransmit         func(scardHandle, *scardIORequest, uintptr, scardDWORD, *scardIORequest, uintptr, *scardDWORD) scardResult
+	scardCancel           func(scardContext) scardResult
 )
 
 func scardError(op string, code scardResult) error {
@@ -53,6 +55,7 @@ func init() {
 	purego.RegisterLibFunc(&scardDisconnect, lib, "SCardDisconnect")
 	purego.RegisterLibFunc(&scardStatus, lib, "SCardStatus")
 	purego.RegisterLibFunc(&scardTransmit, lib, "SCardTransmit")
+	purego.RegisterLibFunc(&scardCancel, lib, "SCardCancel")
 }
 
 func withContext(fn func(scardContext) error) error {
@@ -70,10 +73,10 @@ func withContext(fn func(scardContext) error) error {
 func enumerate() iter.Seq2[*ReaderInfo, error] {
 	return func(yield func(*ReaderInfo, error) bool) {
 		var names []string
-		err := withContext(func(ctx scardContext) error {
+		err := withContext(func(pcscCtx scardContext) error {
 			var size scardDWORD
 
-			if err := scardError("SCardListReaders", scardListReaders(ctx, 0, 0, &size)); err != nil {
+			if err := scardError("SCardListReaders", scardListReaders(pcscCtx, 0, 0, &size)); err != nil {
 				if e := new(Error); errors.As(err, &e) && e.Code == 0x8010002e {
 					return nil
 				}
@@ -84,9 +87,8 @@ func enumerate() iter.Seq2[*ReaderInfo, error] {
 			if size == 0 {
 				return nil
 			}
-
 			buf := make([]byte, size)
-			if err := scardError("SCardListReaders", scardListReaders(ctx, 0, uintptr(unsafe.Pointer(unsafe.SliceData(buf))), &size)); err != nil {
+			if err := scardError("SCardListReaders", scardListReaders(pcscCtx, 0, uintptr(unsafe.Pointer(unsafe.SliceData(buf))), &size)); err != nil {
 				return err
 			}
 
@@ -140,45 +142,61 @@ type card struct {
 }
 
 func open(reader string) (Card, error) {
-	var ctx scardContext
-	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &ctx)); err != nil {
+	var pcscCtx scardContext
+	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &pcscCtx)); err != nil {
 		return nil, err
 	}
-
 	name := append([]byte(reader), 0)
 	var handle scardHandle
 	var protocol scardDWORD
 
-	code := scardConnect(ctx, uintptr(unsafe.Pointer(unsafe.SliceData(name))), scardShareShared, scardProtocolAny, &handle, &protocol)
+	code := scardConnect(pcscCtx, uintptr(unsafe.Pointer(unsafe.SliceData(name))), scardShareShared, scardProtocolAny, &handle, &protocol)
 	runtime.KeepAlive(name)
 
 	if err := scardError("SCardConnect", code); err != nil {
-		_ = scardError("SCardReleaseContext", scardReleaseContext(ctx))
+		_ = scardError("SCardReleaseContext", scardReleaseContext(pcscCtx))
 		return nil, err
 	}
 
-	return &card{context: ctx, handle: handle, protocol: Protocol(uint32(protocol))}, nil
+	return &card{context: pcscCtx, handle: handle, protocol: Protocol(uint32(protocol))}, nil
 }
 
-func (c *card) Transmit(apdu []byte) ([]byte, error) {
+func (c *card) Transmit(ctx context.Context, apdu []byte) ([]byte, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	if c.closed {
+		c.mu.Unlock()
 		return nil, errors.New("pcsc: card closed")
 	}
 
-	request := scardIORequest{Protocol: scardDWORD(c.protocol), Length: scardDWORD(unsafe.Sizeof(scardIORequest{}))}
-	response := make([]byte, maxResponseBufSize)
-	size := scardDWORD(len(response))
-	code := scardTransmit(c.handle, &request, uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), scardDWORD(len(apdu)), nil, uintptr(unsafe.Pointer(unsafe.SliceData(response))), &size)
-	runtime.KeepAlive(apdu)
+	result := make(chan transmitResult, 1)
+	go func() {
+		defer c.mu.Unlock()
 
-	if err := scardError("SCardTransmit", code); err != nil {
-		return nil, err
+		request := scardIORequest{Protocol: scardDWORD(c.protocol), Length: scardDWORD(unsafe.Sizeof(scardIORequest{}))}
+		response := make([]byte, maxResponseBufSize)
+		size := scardDWORD(len(response))
+		code := scardTransmit(c.handle, &request, uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), scardDWORD(len(apdu)), nil, uintptr(unsafe.Pointer(unsafe.SliceData(response))), &size)
+		runtime.KeepAlive(apdu)
+
+		if err := scardError("SCardTransmit", code); err != nil {
+			result <- transmitResult{err: err}
+			return
+		}
+
+		result <- transmitResult{response: bytes.Clone(response[:min(int(size), len(response))])}
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = scardCancel(c.context)
+		return nil, ctx.Err()
+	case r := <-result:
+		return r.response, r.err
 	}
-
-	return bytes.Clone(response[:min(int(size), len(response))]), nil
 }
 
 func (c *card) Status() (*CardStatus, error) {
