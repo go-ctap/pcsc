@@ -37,8 +37,12 @@ for reader, err := range pcsc.Enumerate() {
 	}
 	log.Printf("reader=%q ATR=%x protocol=%d", status.Reader, status.ATR, status.Protocol)
 
-	// SELECT the Token2 applet
-	response, err := card.Transmit(ctx, []byte{0x00, 0xa4, 0x04, 0x00, 0x07, 0xa0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01})
+	// SELECT the standard FIDO applet.
+	response, err := card.Transmit(ctx, []byte{
+		0x00, 0xa4, 0x04, 0x00, 0x08,
+		0xa0, 0x00, 0x00, 0x06, 0x47, 0x2f, 0x00, 0x01,
+		0x00,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
