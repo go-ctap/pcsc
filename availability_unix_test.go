@@ -4,6 +4,7 @@ package pcsc
 
 import (
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -16,10 +17,12 @@ func TestUnavailableNativeLibraryReturnsError(t *testing.T) {
 	})
 
 	loadErr := errors.New("library not found")
+	loadCalls := 0
 	openNativeLibrary = func(string, int) (uintptr, error) {
+		loadCalls++
 		return 0, loadErr
 	}
-	ensureNativeLibrary = loadNativeLibrary
+	ensureNativeLibrary = sync.OnceValue(loadNativeLibrary)
 
 	var enumerateErr error
 	for reader, err := range Enumerate() {
@@ -41,5 +44,8 @@ func TestUnavailableNativeLibraryReturnsError(t *testing.T) {
 	}
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Open error = %v, want ErrUnavailable", err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("native library load calls = %d, want 1", loadCalls)
 	}
 }
