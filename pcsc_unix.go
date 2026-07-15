@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"runtime"
 	"sync"
@@ -39,14 +40,19 @@ var (
 	scardCancel           func(scardContext) scardResult
 )
 
+var (
+	openNativeLibrary   = purego.Dlopen
+	ensureNativeLibrary = sync.OnceValue(loadNativeLibrary)
+)
+
 func scardError(op string, code scardResult) error {
 	return pcscError(op, uint32(code))
 }
 
-func init() {
-	lib, err := purego.Dlopen(pcscLibrary, purego.RTLD_NOW|purego.RTLD_LOCAL)
+func loadNativeLibrary() error {
+	lib, err := openNativeLibrary(pcscLibrary, purego.RTLD_NOW|purego.RTLD_LOCAL)
 	if err != nil {
-		panic("pcsc: load native library: " + err.Error())
+		return fmt.Errorf("%w: load native library: %w", ErrUnavailable, err)
 	}
 	purego.RegisterLibFunc(&scardEstablishContext, lib, "SCardEstablishContext")
 	purego.RegisterLibFunc(&scardReleaseContext, lib, "SCardReleaseContext")
@@ -56,9 +62,15 @@ func init() {
 	purego.RegisterLibFunc(&scardStatus, lib, "SCardStatus")
 	purego.RegisterLibFunc(&scardTransmit, lib, "SCardTransmit")
 	purego.RegisterLibFunc(&scardCancel, lib, "SCardCancel")
+
+	return nil
 }
 
 func withContext(fn func(scardContext) error) error {
+	if err := ensureNativeLibrary(); err != nil {
+		return err
+	}
+
 	var ctx scardContext
 	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &ctx)); err != nil {
 		return err
@@ -142,6 +154,10 @@ type card struct {
 }
 
 func open(reader string) (Card, error) {
+	if err := ensureNativeLibrary(); err != nil {
+		return nil, err
+	}
+
 	var pcscCtx scardContext
 	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &pcscCtx)); err != nil {
 		return nil, err

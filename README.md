@@ -4,6 +4,10 @@ Minimal, CGO-free PC/SC access for Go. Windows calls `winscard.dll` through
 `golang.org/x/sys/windows`; macOS loads the PCSC framework and Linux loads
 `libpcsclite.so.1` at runtime through `purego`.
 
+Importing the package does not load the native PC/SC runtime. If it is not
+installed, `Enumerate` yields and `Open` returns `pcsc.ErrUnavailable`, so
+applications can keep PC/SC support optional.
+
 The package intentionally exposes only the primitives needed by token clients:
 reader enumeration, connect/disconnect, status/ATR and raw APDU exchange.
 

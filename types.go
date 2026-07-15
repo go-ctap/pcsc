@@ -2,9 +2,13 @@ package pcsc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 )
+
+// ErrUnavailable indicates that the platform PC/SC runtime could not be loaded.
+var ErrUnavailable = errors.New("pcsc: unavailable")
 
 // ReaderInfo describes a PC/SC reader. Name is the stable identifier accepted by Open.
 type ReaderInfo struct {
