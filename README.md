@@ -1,5 +1,8 @@
 # go-pcsc
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-ctap/pcsc.svg)](https://pkg.go.dev/github.com/go-ctap/pcsc)
+[![Go](https://github.com/go-ctap/pcsc/actions/workflows/go.yml/badge.svg)](https://github.com/go-ctap/pcsc/actions/workflows/go.yml)
+
 Minimal, CGO-free PC/SC access for Go. Windows calls `winscard.dll` through
 `golang.org/x/sys/windows`; macOS loads the PCSC framework and Linux loads
 `libpcsclite.so.1` at runtime through `purego`.
