@@ -1,4 +1,4 @@
-# go-pcsc
+# go-ctap/pcsc
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-ctap/pcsc.svg)](https://pkg.go.dev/github.com/go-ctap/pcsc)
 [![Go](https://github.com/go-ctap/pcsc/actions/workflows/go.yml/badge.svg)](https://github.com/go-ctap/pcsc/actions/workflows/go.yml)
