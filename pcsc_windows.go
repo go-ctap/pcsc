@@ -3,12 +3,9 @@
 package pcsc
 
 import (
-	"bytes"
-	"context"
 	"errors"
-	"iter"
 	"runtime"
-	"sync"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -16,12 +13,9 @@ import (
 )
 
 const (
-	scardScopeSystem      = 2
-	scardShareShared      = 2
-	scardLeaveCard        = 0
-	scardProtocolAny      = uint32(ProtocolT0 | ProtocolT1)
-	scardEInsufficientBuf = uint32(0x80100008)
-	maxResponseBufSize    = 65538
+	scardScopeSystem        = 2
+	scardReaderStateATRSize = 36
+	scardReaderStatePacked  = false
 )
 
 type scardHandle = uintptr
@@ -29,33 +23,142 @@ type scardContext = uintptr
 type scardDWORD = uint32
 type scardResult = uint32
 
-type scardIORequest struct {
-	Protocol scardDWORD
-	Length   scardDWORD
-}
-
 var (
 	modWinSCard               = windows.NewLazySystemDLL("winscard.dll")
 	procSCardEstablishContext = modWinSCard.NewProc("SCardEstablishContext")
 	procSCardReleaseContext   = modWinSCard.NewProc("SCardReleaseContext")
 	procSCardListReadersW     = modWinSCard.NewProc("SCardListReadersW")
 	procSCardConnectW         = modWinSCard.NewProc("SCardConnectW")
+	procSCardReconnect        = modWinSCard.NewProc("SCardReconnect")
 	procSCardDisconnect       = modWinSCard.NewProc("SCardDisconnect")
+	procSCardBeginTransaction = modWinSCard.NewProc("SCardBeginTransaction")
+	procSCardEndTransaction   = modWinSCard.NewProc("SCardEndTransaction")
 	procSCardStatusW          = modWinSCard.NewProc("SCardStatusW")
 	procSCardTransmit         = modWinSCard.NewProc("SCardTransmit")
+	procSCardControl          = modWinSCard.NewProc("SCardControl")
+	procSCardGetAttrib        = modWinSCard.NewProc("SCardGetAttrib")
+	procSCardSetAttrib        = modWinSCard.NewProc("SCardSetAttrib")
+	procSCardGetStatusChangeW = modWinSCard.NewProc("SCardGetStatusChangeW")
 	procSCardCancel           = modWinSCard.NewProc("SCardCancel")
 )
 
-var scardTransmit = func(handle scardHandle, sendPCI *scardIORequest, sendBuffer uintptr, sendLength scardDWORD, recvPCI *scardIORequest, recvBuffer uintptr, recvLength *scardDWORD) scardResult {
-	code := callCode(procSCardTransmit, handle, uintptr(unsafe.Pointer(sendPCI)), sendBuffer, uintptr(sendLength), uintptr(unsafe.Pointer(recvPCI)), recvBuffer, uintptr(unsafe.Pointer(recvLength)))
+var scardTransmit = func(
+	handle scardHandle,
+	sendPCI *scardIORequest,
+	sendBuffer uintptr,
+	sendLength scardDWORD,
+	receivePCI *scardIORequest,
+	receiveBuffer uintptr,
+	receiveLength *scardDWORD,
+) scardResult {
+	result := callCode(
+		procSCardTransmit,
+		handle,
+		uintptr(unsafe.Pointer(sendPCI)),
+		sendBuffer,
+		uintptr(sendLength),
+		uintptr(unsafe.Pointer(receivePCI)),
+		receiveBuffer,
+		uintptr(unsafe.Pointer(receiveLength)),
+	)
 	runtime.KeepAlive(sendPCI)
-	runtime.KeepAlive(recvPCI)
-	runtime.KeepAlive(recvLength)
-	return code
+	runtime.KeepAlive(receivePCI)
+	runtime.KeepAlive(receiveLength)
+
+	return result
 }
 
-var scardCancel = func(ctx scardContext) scardResult {
-	return scardResult(callCode(procSCardCancel, ctx))
+var scardCancel = func(context scardContext) scardResult {
+	return scardResult(callCode(procSCardCancel, context))
+}
+
+var scardBeginTransaction = func(handle scardHandle) scardResult {
+	return scardResult(callCode(procSCardBeginTransaction, handle))
+}
+
+var scardEndTransaction = func(handle scardHandle, disposition scardDWORD) scardResult {
+	return scardResult(callCode(procSCardEndTransaction, handle, uintptr(disposition)))
+}
+
+var scardDisconnect = func(handle scardHandle, disposition scardDWORD) scardResult {
+	return scardResult(callCode(procSCardDisconnect, handle, uintptr(disposition)))
+}
+
+var scardReconnect = func(
+	handle scardHandle,
+	shareMode scardDWORD,
+	preferredProtocols scardDWORD,
+	initialization scardDWORD,
+	activeProtocol *scardDWORD,
+) scardResult {
+	result := callCode(
+		procSCardReconnect,
+		handle,
+		uintptr(shareMode),
+		uintptr(preferredProtocols),
+		uintptr(initialization),
+		uintptr(unsafe.Pointer(activeProtocol)),
+	)
+	runtime.KeepAlive(activeProtocol)
+
+	return scardResult(result)
+}
+
+var scardControl = func(
+	handle scardHandle,
+	controlCode scardDWORD,
+	input uintptr,
+	inputLength scardDWORD,
+	output uintptr,
+	outputLength scardDWORD,
+	bytesReturned *scardDWORD,
+) scardResult {
+	result := callCode(
+		procSCardControl,
+		handle,
+		uintptr(controlCode),
+		input,
+		uintptr(inputLength),
+		output,
+		uintptr(outputLength),
+		uintptr(unsafe.Pointer(bytesReturned)),
+	)
+	runtime.KeepAlive(bytesReturned)
+
+	return scardResult(result)
+}
+
+var scardGetAttrib = func(
+	handle scardHandle,
+	attribute scardDWORD,
+	value uintptr,
+	valueLength *scardDWORD,
+) scardResult {
+	result := callCode(
+		procSCardGetAttrib,
+		handle,
+		uintptr(attribute),
+		value,
+		uintptr(unsafe.Pointer(valueLength)),
+	)
+	runtime.KeepAlive(valueLength)
+
+	return scardResult(result)
+}
+
+var scardSetAttrib = func(
+	handle scardHandle,
+	attribute scardDWORD,
+	value uintptr,
+	valueLength scardDWORD,
+) scardResult {
+	return scardResult(callCode(
+		procSCardSetAttrib,
+		handle,
+		uintptr(attribute),
+		value,
+		uintptr(valueLength),
+	))
 }
 
 func callCode(proc *windows.LazyProc, args ...uintptr) uint32 {
@@ -63,50 +166,81 @@ func callCode(proc *windows.LazyProc, args ...uintptr) uint32 {
 	return uint32(r)
 }
 
-func establishContext() (uintptr, error) {
-	var ctx uintptr
-	code := callCode(procSCardEstablishContext, scardScopeSystem, 0, 0, uintptr(unsafe.Pointer(&ctx)))
+func establishNativeContext() (scardContext, error) {
+	var context uintptr
+	result := callCode(
+		procSCardEstablishContext,
+		scardScopeSystem,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&context)),
+	)
 
-	return ctx, pcscError("SCardEstablishContext", code)
+	return context, pcscError("SCardEstablishContext", result)
 }
 
-func enumerate() iter.Seq2[*ReaderInfo, error] {
-	return func(yield func(*ReaderInfo, error) bool) {
-		pcscCtx, err := establishContext()
-		if err != nil {
-			yield(nil, err)
-			return
-		}
+func releaseNativeContext(context scardContext) error {
+	return pcscError("SCardReleaseContext", callCode(procSCardReleaseContext, context))
+}
 
-		defer func() { _ = callCode(procSCardReleaseContext, pcscCtx) }()
+func cancelNativeContext(context scardContext) error {
+	return pcscError("SCardCancel", uint32(scardCancel(context)))
+}
 
-		var size uint32
-		code := callCode(procSCardListReadersW, pcscCtx, 0, 0, uintptr(unsafe.Pointer(&size)))
-		if uint32(code) == 0x8010002e {
-			return
+func listReadersNative(context scardContext) ([]string, error) {
+	var size uint32
+	code := callCode(procSCardListReadersW, context, 0, 0, uintptr(unsafe.Pointer(&size)))
+	if err := pcscError("SCardListReadersW", code); err != nil {
+		if errors.Is(err, ErrNoReaders) {
+			return nil, nil
 		}
-
-		if err := pcscError("SCardListReadersW", code); err != nil {
-			yield(nil, err)
-			return
-		}
-
-		if size == 0 {
-			return
-		}
-		buf := make([]uint16, size)
-		code = callCode(procSCardListReadersW, pcscCtx, 0, uintptr(unsafe.Pointer(unsafe.SliceData(buf))), uintptr(unsafe.Pointer(&size)))
-		if err := pcscError("SCardListReadersW", code); err != nil {
-			yield(nil, err)
-			return
-		}
-
-		for _, name := range parseUTF16MultiString(buf[:min(int(size), len(buf))]) {
-			if !yield(&ReaderInfo{Name: name}, nil) {
-				return
-			}
-		}
+		return nil, err
 	}
+	if size == 0 {
+		return nil, nil
+	}
+
+	buffer := make([]uint16, size)
+	code = callCode(
+		procSCardListReadersW,
+		context,
+		0,
+		uintptr(unsafe.Pointer(unsafe.SliceData(buffer))),
+		uintptr(unsafe.Pointer(&size)),
+	)
+	if err := pcscError("SCardListReadersW", code); err != nil {
+		return nil, err
+	}
+
+	return parseUTF16MultiString(buffer[:min(int(size), len(buffer))]), nil
+}
+
+func getStatusChangeNative(context scardContext, timeout time.Duration, states []nativeReaderState) error {
+	names := make([][]uint16, len(states))
+	namePointers := make([]uintptr, len(states))
+	for index, state := range states {
+		names[index] = append(utf16.Encode([]rune(state.name)), 0)
+		namePointers[index] = uintptr(unsafe.Pointer(unsafe.SliceData(names[index])))
+	}
+
+	layout := newNativeReaderStateLayout(scardReaderStateATRSize, scardReaderStatePacked)
+	buffer := layout.encode(states, namePointers)
+	code := callCode(
+		procSCardGetStatusChangeW,
+		context,
+		uintptr(durationMilliseconds(timeout)),
+		uintptr(unsafe.Pointer(unsafe.SliceData(buffer))),
+		uintptr(len(states)),
+	)
+	runtime.KeepAlive(names)
+
+	if err := pcscError("SCardGetStatusChangeW", code); err != nil {
+		return err
+	}
+
+	layout.decode(buffer, states)
+
+	return nil
 }
 
 func parseUTF16MultiString(buf []uint16) []string {
@@ -132,88 +266,66 @@ func parseUTF16MultiString(buf []uint16) []string {
 	return out
 }
 
-type card struct {
-	mu       sync.Mutex
-	context  scardContext
-	handle   uintptr
-	protocol Protocol
-	closed   bool
-}
-
-func open(reader string) (Card, error) {
-	pcscCtx, err := establishContext()
+// Open connects to the card in reader. By default it uses shared access,
+// negotiates T=0 or T=1, and leaves the card powered when closed.
+func Open(reader string, opts ...OpenOption) (*Card, error) {
+	options := newOpenOptions(opts...)
+	context, err := establishNativeContext()
 	if err != nil {
 		return nil, err
 	}
+
 	name, err := windows.UTF16PtrFromString(reader)
 	if err != nil {
-		_ = callCode(procSCardReleaseContext, pcscCtx)
-		return nil, err
+		return nil, errors.Join(err, releaseNativeContext(context))
 	}
 
 	var handle uintptr
 	var protocol uint32
 
-	code := callCode(procSCardConnectW, pcscCtx, uintptr(unsafe.Pointer(name)), scardShareShared, uintptr(scardProtocolAny), uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&protocol)))
+	code := callCode(
+		procSCardConnectW,
+		context,
+		uintptr(unsafe.Pointer(name)),
+		uintptr(options.shareMode),
+		uintptr(options.preferredProtocols),
+		uintptr(unsafe.Pointer(&handle)),
+		uintptr(unsafe.Pointer(&protocol)),
+	)
 	runtime.KeepAlive(name)
 
 	if err := pcscError("SCardConnectW", code); err != nil {
-		_ = callCode(procSCardReleaseContext, pcscCtx)
-		return nil, err
+		return nil, errors.Join(err, releaseNativeContext(context))
 	}
 
-	return &card{context: pcscCtx, handle: handle, protocol: Protocol(protocol)}, nil
+	return &Card{
+		context:               context,
+		handle:                handle,
+		protocol:              Protocol(protocol),
+		disconnectDisposition: options.disconnectDisposition,
+	}, nil
 }
 
-func (c *card) Transmit(ctx context.Context, apdu []byte) ([]byte, error) {
-	c.mu.Lock()
-	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
-		return nil, err
-	}
-	if c.closed {
-		c.mu.Unlock()
-		return nil, errors.New("pcsc: card closed")
-	}
+func (card *Card) Status() (*CardStatus, error) {
+	card.mu.Lock()
+	defer card.mu.Unlock()
 
-	result := make(chan transmitResult, 1)
-	go func() {
-		defer c.mu.Unlock()
-
-		request := scardIORequest{Protocol: scardDWORD(c.protocol), Length: scardDWORD(unsafe.Sizeof(scardIORequest{}))}
-		response := make([]byte, maxResponseBufSize)
-		size := scardDWORD(len(response))
-		code := scardTransmit(c.handle, &request, uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), scardDWORD(len(apdu)), nil, uintptr(unsafe.Pointer(unsafe.SliceData(response))), &size)
-		runtime.KeepAlive(apdu)
-
-		if err := pcscError("SCardTransmit", uint32(code)); err != nil {
-			result <- transmitResult{err: err}
-			return
-		}
-
-		result <- transmitResult{response: bytes.Clone(response[:min(int(size), len(response))])}
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = scardCancel(c.context)
-		return nil, ctx.Err()
-	case r := <-result:
-		return r.response, r.err
-	}
-}
-
-func (c *card) Status() (*CardStatus, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil, errors.New("pcsc: card closed")
+	if card.closed {
+		return nil, ErrClosed
 	}
 
 	var readerLen, atrLen, state, protocol uint32
 
-	code := callCode(procSCardStatusW, c.handle, 0, uintptr(unsafe.Pointer(&readerLen)), uintptr(unsafe.Pointer(&state)), uintptr(unsafe.Pointer(&protocol)), 0, uintptr(unsafe.Pointer(&atrLen)))
+	code := callCode(
+		procSCardStatusW,
+		card.handle,
+		0,
+		uintptr(unsafe.Pointer(&readerLen)),
+		uintptr(unsafe.Pointer(&state)),
+		uintptr(unsafe.Pointer(&protocol)),
+		0,
+		uintptr(unsafe.Pointer(&atrLen)),
+	)
 	if code != 0 && uint32(code) != scardEInsufficientBuf {
 		return nil, pcscError("SCardStatusW", code)
 	}
@@ -221,55 +333,30 @@ func (c *card) Status() (*CardStatus, error) {
 	reader := make([]uint16, readerLen)
 	atr := make([]byte, atrLen)
 
-	code = callCode(procSCardStatusW, c.handle, uint16SlicePointer(reader), uintptr(unsafe.Pointer(&readerLen)), uintptr(unsafe.Pointer(&state)), uintptr(unsafe.Pointer(&protocol)), byteSlicePointer(atr), uintptr(unsafe.Pointer(&atrLen)))
+	code = callCode(
+		procSCardStatusW,
+		card.handle,
+		uintptr(unsafe.Pointer(unsafe.SliceData(reader))),
+		uintptr(unsafe.Pointer(&readerLen)),
+		uintptr(unsafe.Pointer(&state)),
+		uintptr(unsafe.Pointer(&protocol)),
+		byteSlicePointer(atr),
+		uintptr(unsafe.Pointer(&atrLen)),
+	)
 	if err := pcscError("SCardStatusW", code); err != nil {
 		return nil, err
 	}
-
-	return &CardStatus{
-		Reader:   firstUTF16String(reader),
-		State:    state,
-		Protocol: Protocol(protocol),
-		ATR:      bytes.Clone(atr[:min(int(atrLen), len(atr))]),
-	}, nil
-}
-
-func uint16SlicePointer(b []uint16) uintptr {
-	if len(b) == 0 {
-		return 0
-	}
-
-	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-}
-
-func byteSlicePointer(b []byte) uintptr {
-	if len(b) == 0 {
-		return 0
-	}
-
-	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-}
-
-func firstUTF16String(b []uint16) string {
-	for i, v := range b {
-		if v == 0 {
-			b = b[:i]
+	for index, character := range reader {
+		if character == 0 {
+			reader = reader[:index]
 			break
 		}
 	}
 
-	return string(utf16.Decode(b))
-}
-
-func (c *card) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil
-	}
-
-	c.closed = true
-
-	return errors.Join(pcscError("SCardDisconnect", callCode(procSCardDisconnect, c.handle, scardLeaveCard)), pcscError("SCardReleaseContext", callCode(procSCardReleaseContext, c.context)))
+	return &CardStatus{
+		ReaderName: string(utf16.Decode(reader)),
+		State:      CardState(state),
+		Protocol:   Protocol(protocol),
+		ATR:        atr[:min(int(atrLen), len(atr))],
+	}, nil
 }

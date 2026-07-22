@@ -4,50 +4,77 @@ package pcsc
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"iter"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
 )
 
-const (
-	scardScopeSystem      = 2
-	scardShareShared      = 2
-	scardLeaveCard        = 0
-	scardProtocolAny      = scardDWORD(ProtocolT0 | ProtocolT1)
-	scardEInsufficientBuf = uint32(0x80100008)
-	maxResponseBufSize    = 65538
-)
-
-type scardIORequest struct {
-	Protocol scardDWORD
-	Length   scardDWORD
-}
+const scardScopeSystem = 2
 
 var (
 	scardEstablishContext func(scardDWORD, uintptr, uintptr, *scardContext) scardResult
 	scardReleaseContext   func(scardContext) scardResult
 	scardListReaders      func(scardContext, uintptr, uintptr, *scardDWORD) scardResult
-	scardConnect          func(scardContext, uintptr, scardDWORD, scardDWORD, *scardHandle, *scardDWORD) scardResult
+	scardConnect          func(
+		scardContext,
+		uintptr,
+		scardDWORD,
+		scardDWORD,
+		*scardHandle,
+		*scardDWORD,
+	) scardResult
+	scardReconnect func(
+		scardHandle,
+		scardDWORD,
+		scardDWORD,
+		scardDWORD,
+		*scardDWORD,
+	) scardResult
 	scardDisconnect       func(scardHandle, scardDWORD) scardResult
-	scardStatus           func(scardHandle, uintptr, *scardDWORD, *scardDWORD, *scardDWORD, uintptr, *scardDWORD) scardResult
-	scardTransmit         func(scardHandle, *scardIORequest, uintptr, scardDWORD, *scardIORequest, uintptr, *scardDWORD) scardResult
-	scardCancel           func(scardContext) scardResult
+	scardBeginTransaction func(scardHandle) scardResult
+	scardEndTransaction   func(scardHandle, scardDWORD) scardResult
+	scardStatus           func(
+		scardHandle,
+		uintptr,
+		*scardDWORD,
+		*scardDWORD,
+		*scardDWORD,
+		uintptr,
+		*scardDWORD,
+	) scardResult
+	scardTransmit func(
+		scardHandle,
+		*scardIORequest,
+		uintptr,
+		scardDWORD,
+		*scardIORequest,
+		uintptr,
+		*scardDWORD,
+	) scardResult
+	scardControl func(
+		scardHandle,
+		scardDWORD,
+		uintptr,
+		scardDWORD,
+		uintptr,
+		scardDWORD,
+		*scardDWORD,
+	) scardResult
+	scardGetAttrib       func(scardHandle, scardDWORD, uintptr, *scardDWORD) scardResult
+	scardSetAttrib       func(scardHandle, scardDWORD, uintptr, scardDWORD) scardResult
+	scardGetStatusChange func(scardContext, scardDWORD, uintptr, scardDWORD) scardResult
+	scardCancel          func(scardContext) scardResult
 )
 
 var (
 	openNativeLibrary   = purego.Dlopen
 	ensureNativeLibrary = sync.OnceValue(loadNativeLibrary)
 )
-
-func scardError(op string, code scardResult) error {
-	return pcscError(op, uint32(code))
-}
 
 func loadNativeLibrary() error {
 	lib, err := openNativeLibrary(pcscLibrary, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -58,68 +85,92 @@ func loadNativeLibrary() error {
 	purego.RegisterLibFunc(&scardReleaseContext, lib, "SCardReleaseContext")
 	purego.RegisterLibFunc(&scardListReaders, lib, "SCardListReaders")
 	purego.RegisterLibFunc(&scardConnect, lib, "SCardConnect")
+	purego.RegisterLibFunc(&scardReconnect, lib, "SCardReconnect")
 	purego.RegisterLibFunc(&scardDisconnect, lib, "SCardDisconnect")
+	purego.RegisterLibFunc(&scardBeginTransaction, lib, "SCardBeginTransaction")
+	purego.RegisterLibFunc(&scardEndTransaction, lib, "SCardEndTransaction")
 	purego.RegisterLibFunc(&scardStatus, lib, "SCardStatus")
 	purego.RegisterLibFunc(&scardTransmit, lib, "SCardTransmit")
+	purego.RegisterLibFunc(&scardControl, lib, "SCardControl")
+	purego.RegisterLibFunc(&scardGetAttrib, lib, "SCardGetAttrib")
+	purego.RegisterLibFunc(&scardSetAttrib, lib, "SCardSetAttrib")
+	purego.RegisterLibFunc(&scardGetStatusChange, lib, "SCardGetStatusChange")
 	purego.RegisterLibFunc(&scardCancel, lib, "SCardCancel")
 
 	return nil
 }
 
-func withContext(fn func(scardContext) error) error {
+func establishNativeContext() (scardContext, error) {
 	if err := ensureNativeLibrary(); err != nil {
-		return err
+		return 0, err
 	}
 
-	var ctx scardContext
-	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &ctx)); err != nil {
-		return err
-	}
+	var context scardContext
+	err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &context))
 
-	err := fn(ctx)
-	releaseErr := scardError("SCardReleaseContext", scardReleaseContext(ctx))
-
-	return errors.Join(err, releaseErr)
+	return context, err
 }
 
-func enumerate() iter.Seq2[*ReaderInfo, error] {
-	return func(yield func(*ReaderInfo, error) bool) {
-		var names []string
-		err := withContext(func(pcscCtx scardContext) error {
-			var size scardDWORD
+func releaseNativeContext(context scardContext) error {
+	return scardError("SCardReleaseContext", scardReleaseContext(context))
+}
 
-			if err := scardError("SCardListReaders", scardListReaders(pcscCtx, 0, 0, &size)); err != nil {
-				if e := new(Error); errors.As(err, &e) && e.Code == 0x8010002e {
-					return nil
-				}
+func cancelNativeContext(context scardContext) error {
+	return scardError("SCardCancel", scardCancel(context))
+}
 
-				return err
-			}
-
-			if size == 0 {
-				return nil
-			}
-			buf := make([]byte, size)
-			if err := scardError("SCardListReaders", scardListReaders(pcscCtx, 0, uintptr(unsafe.Pointer(unsafe.SliceData(buf))), &size)); err != nil {
-				return err
-			}
-
-			names = parseMultiString(buf[:min(int(size), len(buf))])
-
-			return nil
-		})
-
-		if err != nil {
-			yield(nil, err)
-			return
+func listReadersNative(context scardContext) ([]string, error) {
+	var size scardDWORD
+	if err := scardError("SCardListReaders", scardListReaders(context, 0, 0, &size)); err != nil {
+		if errors.Is(err, ErrNoReaders) {
+			return nil, nil
 		}
-
-		for _, name := range names {
-			if !yield(&ReaderInfo{Name: name}, nil) {
-				return
-			}
-		}
+		return nil, err
 	}
+	if size == 0 {
+		return nil, nil
+	}
+
+	buffer := make([]byte, size)
+	code := scardListReaders(
+		context,
+		0,
+		uintptr(unsafe.Pointer(unsafe.SliceData(buffer))),
+		&size,
+	)
+	if err := scardError("SCardListReaders", code); err != nil {
+		return nil, err
+	}
+
+	return parseMultiString(buffer[:min(int(size), len(buffer))]), nil
+}
+
+func getStatusChangeNative(context scardContext, timeout time.Duration, states []nativeReaderState) error {
+	names := make([][]byte, len(states))
+	namePointers := make([]uintptr, len(states))
+	for index, state := range states {
+		names[index] = append([]byte(state.name), 0)
+		namePointers[index] = uintptr(unsafe.Pointer(unsafe.SliceData(names[index])))
+	}
+
+	layout := newNativeReaderStateLayout(scardReaderStateATRSize, scardReaderStatePacked)
+	buffer := layout.encode(states, namePointers)
+	timeoutMilliseconds := durationMilliseconds(timeout)
+	code := scardGetStatusChange(
+		context,
+		scardDWORD(timeoutMilliseconds),
+		uintptr(unsafe.Pointer(unsafe.SliceData(buffer))),
+		scardDWORD(len(states)),
+	)
+	runtime.KeepAlive(names)
+
+	if err := scardError("SCardGetStatusChange", code); err != nil {
+		return err
+	}
+
+	layout.decode(buffer, states)
+
+	return nil
 }
 
 func parseMultiString(buf []byte) []string {
@@ -145,88 +196,53 @@ func parseMultiString(buf []byte) []string {
 	return out
 }
 
-type card struct {
-	mu       sync.Mutex
-	context  scardContext
-	handle   scardHandle
-	protocol Protocol
-	closed   bool
-}
-
-func open(reader string) (Card, error) {
-	if err := ensureNativeLibrary(); err != nil {
+// Open connects to the card in reader. By default it uses shared access,
+// negotiates T=0 or T=1, and leaves the card powered when closed.
+func Open(reader string, opts ...OpenOption) (*Card, error) {
+	options := newOpenOptions(opts...)
+	context, err := establishNativeContext()
+	if err != nil {
 		return nil, err
 	}
 
-	var pcscCtx scardContext
-	if err := scardError("SCardEstablishContext", scardEstablishContext(scardScopeSystem, 0, 0, &pcscCtx)); err != nil {
-		return nil, err
-	}
 	name := append([]byte(reader), 0)
 	var handle scardHandle
 	var protocol scardDWORD
 
-	code := scardConnect(pcscCtx, uintptr(unsafe.Pointer(unsafe.SliceData(name))), scardShareShared, scardProtocolAny, &handle, &protocol)
+	code := scardConnect(
+		context,
+		uintptr(unsafe.Pointer(unsafe.SliceData(name))),
+		scardDWORD(options.shareMode),
+		scardDWORD(options.preferredProtocols),
+		&handle,
+		&protocol,
+	)
 	runtime.KeepAlive(name)
 
 	if err := scardError("SCardConnect", code); err != nil {
-		_ = scardError("SCardReleaseContext", scardReleaseContext(pcscCtx))
-		return nil, err
+		return nil, errors.Join(err, releaseNativeContext(context))
 	}
 
-	return &card{context: pcscCtx, handle: handle, protocol: Protocol(uint32(protocol))}, nil
+	return &Card{
+		context:               context,
+		handle:                handle,
+		protocol:              Protocol(uint32(protocol)),
+		disconnectDisposition: options.disconnectDisposition,
+	}, nil
 }
 
-func (c *card) Transmit(ctx context.Context, apdu []byte) ([]byte, error) {
-	c.mu.Lock()
-	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
-		return nil, err
-	}
-	if c.closed {
-		c.mu.Unlock()
-		return nil, errors.New("pcsc: card closed")
-	}
+func (card *Card) Status() (*CardStatus, error) {
+	card.mu.Lock()
+	defer card.mu.Unlock()
 
-	result := make(chan transmitResult, 1)
-	go func() {
-		defer c.mu.Unlock()
-
-		request := scardIORequest{Protocol: scardDWORD(c.protocol), Length: scardDWORD(unsafe.Sizeof(scardIORequest{}))}
-		response := make([]byte, maxResponseBufSize)
-		size := scardDWORD(len(response))
-		code := scardTransmit(c.handle, &request, uintptr(unsafe.Pointer(unsafe.SliceData(apdu))), scardDWORD(len(apdu)), nil, uintptr(unsafe.Pointer(unsafe.SliceData(response))), &size)
-		runtime.KeepAlive(apdu)
-
-		if err := scardError("SCardTransmit", code); err != nil {
-			result <- transmitResult{err: err}
-			return
-		}
-
-		result <- transmitResult{response: bytes.Clone(response[:min(int(size), len(response))])}
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = scardCancel(c.context)
-		return nil, ctx.Err()
-	case r := <-result:
-		return r.response, r.err
-	}
-}
-
-func (c *card) Status() (*CardStatus, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil, errors.New("pcsc: card closed")
+	if card.closed {
+		return nil, ErrClosed
 	}
 
 	var readerLen, atrLen scardDWORD
 	var state, protocol scardDWORD
 
-	code := scardStatus(c.handle, 0, &readerLen, &state, &protocol, 0, &atrLen)
+	code := scardStatus(card.handle, 0, &readerLen, &state, &protocol, 0, &atrLen)
 	if code != 0 && uint32(code) != scardEInsufficientBuf {
 		return nil, scardError("SCardStatus", code)
 	}
@@ -234,44 +250,26 @@ func (c *card) Status() (*CardStatus, error) {
 	reader := make([]byte, readerLen)
 	atr := make([]byte, atrLen)
 
-	code = scardStatus(c.handle, slicePointer(reader), &readerLen, &state, &protocol, slicePointer(atr), &atrLen)
+	code = scardStatus(
+		card.handle,
+		byteSlicePointer(reader),
+		&readerLen,
+		&state,
+		&protocol,
+		byteSlicePointer(atr),
+		&atrLen,
+	)
 	if err := scardError("SCardStatus", code); err != nil {
 		return nil, err
 	}
+	if index := bytes.IndexByte(reader, 0); index >= 0 {
+		reader = reader[:index]
+	}
 
 	return &CardStatus{
-		Reader:   firstString(reader),
-		State:    uint32(state),
-		Protocol: Protocol(uint32(protocol)),
-		ATR:      bytes.Clone(atr[:min(int(atrLen), len(atr))]),
+		ReaderName: string(reader),
+		State:      CardState(uint32(state)),
+		Protocol:   Protocol(uint32(protocol)),
+		ATR:        atr[:min(int(atrLen), len(atr))],
 	}, nil
-}
-
-func slicePointer(b []byte) uintptr {
-	if len(b) == 0 {
-		return 0
-	}
-
-	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-}
-
-func firstString(b []byte) string {
-	if i := bytes.IndexByte(b, 0); i >= 0 {
-		b = b[:i]
-	}
-
-	return string(b)
-}
-
-func (c *card) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil
-	}
-
-	c.closed = true
-
-	return errors.Join(scardError("SCardDisconnect", scardDisconnect(c.handle, scardLeaveCard)), scardError("SCardReleaseContext", scardReleaseContext(c.context)))
 }

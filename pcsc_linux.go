@@ -4,6 +4,11 @@ package pcsc
 
 const pcscLibrary = "libpcsclite.so.1"
 
+const (
+	scardReaderStateATRSize = 33
+	scardReaderStatePacked  = false
+)
+
 // pcsc-lite handles are pointer-sized integer tokens on Unix platforms other than macOS.
 type scardContext uintptr
 type scardHandle uintptr

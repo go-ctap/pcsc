@@ -1,18 +1,11 @@
 package pcsc
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"iter"
-)
-
-// ErrUnavailable indicates that the platform PC/SC runtime could not be loaded.
-var ErrUnavailable = errors.New("pcsc: unavailable")
-
-// ReaderInfo describes a PC/SC reader. Name is the stable identifier accepted by Open.
+// ReaderInfo describes a PC/SC reader snapshot. Name is the stable identifier
+// accepted by Open.
 type ReaderInfo struct {
-	Name string
+	Name  string
+	State ReaderState
+	ATR   []byte
 }
 
 // Protocol is the transport protocol negotiated with a card.
@@ -22,87 +15,57 @@ const (
 	ProtocolUndefined Protocol = 0
 	ProtocolT0        Protocol = 1
 	ProtocolT1        Protocol = 2
-	ProtocolRaw       Protocol = 4
+)
+
+// ShareMode controls how a card connection is shared with other applications.
+type ShareMode uint32
+
+const (
+	ShareExclusive ShareMode = 1
+	ShareShared    ShareMode = 2
+	ShareDirect    ShareMode = 3
+)
+
+// Disposition controls what PC/SC does with a card when a connection or
+// transaction ends.
+type Disposition uint32
+
+const (
+	LeaveCard   Disposition = 0
+	ResetCard   Disposition = 1
+	UnpowerCard Disposition = 2
+	EjectCard   Disposition = 3
+)
+
+// CardState is the state reported for an open card by SCardStatus. PC/SC uses
+// platform-specific values for this type.
+type CardState uint32
+
+// ReaderState is the state bitmask used by SCardGetStatusChange.
+type ReaderState uint32
+
+const (
+	ReaderStateUnaware     ReaderState = 0x0000
+	ReaderStateIgnore      ReaderState = 0x0001
+	ReaderStateChanged     ReaderState = 0x0002
+	ReaderStateUnknown     ReaderState = 0x0004
+	ReaderStateUnavailable ReaderState = 0x0008
+	ReaderStateEmpty       ReaderState = 0x0010
+	ReaderStatePresent     ReaderState = 0x0020
+	ReaderStateATRMatch    ReaderState = 0x0040
+	ReaderStateExclusive   ReaderState = 0x0080
+	ReaderStateInUse       ReaderState = 0x0100
+	ReaderStateMute        ReaderState = 0x0200
+	ReaderStateUnpowered   ReaderState = 0x0400
 )
 
 // CardStatus is a snapshot of a connected card.
 type CardStatus struct {
-	Reader   string
-	State    uint32
-	Protocol Protocol
-	ATR      []byte
+	ReaderName string
+	State      CardState
+	Protocol   Protocol
+	ATR        []byte
 }
 
-type transmitResult struct {
-	response []byte
-	err      error
-}
-
-// Card is a connection to a smart card. Transmit sends one raw APDU and returns
-// the complete response, including SW1/SW2. Cancellation is best-effort: a
-// driver may continue an in-flight APDU after Transmit returns ctx.Err().
-type Card interface {
-	Transmit(ctx context.Context, apdu []byte) ([]byte, error)
-	Status() (*CardStatus, error)
-	Close() error
-}
-
-// Error is a PC/SC return code annotated with the operation which failed.
-type Error struct {
-	Op   string
-	Code uint32
-}
-
-func (e *Error) Error() string {
-	if name := errorName(e.Code); name != "" {
-		return fmt.Sprintf("pcsc: %s: %s (0x%08x)", e.Op, name, e.Code)
-	}
-	return fmt.Sprintf("pcsc: %s failed (0x%08x)", e.Op, e.Code)
-}
-
-func pcscError(op string, code uint32) error {
-	if code == 0 {
-		return nil
-	}
-	return &Error{Op: op, Code: code}
-}
-
-func errorName(code uint32) string {
-	switch code {
-	case 0x80100002:
-		return "cancelled"
-	case 0x80100008:
-		return "insufficient buffer"
-	case 0x80100009:
-		return "unknown reader"
-	case 0x8010000c:
-		return "no smart card"
-	case 0x8010000e:
-		return "cannot dispose"
-	case 0x8010000f:
-		return "protocol mismatch"
-	case 0x80100010:
-		return "not ready"
-	case 0x80100016:
-		return "not transacted"
-	case 0x80100017:
-		return "reader unavailable"
-	case 0x8010001d:
-		return "no service"
-	case 0x8010001e:
-		return "service stopped"
-	case 0x8010002e:
-		return "no readers available"
-	case 0x80100068:
-		return "card reset"
-	case 0x80100069:
-		return "card removed"
-	}
-	return ""
-}
-
-// Enumerate returns the currently registered PC/SC readers.
-func Enumerate() iter.Seq2[*ReaderInfo, error] { return enumerate() }
-
-// Open connects to the card in reader using shared access and negotiates T=0 or T=1.
-func Open(reader string) (Card, error) { return open(reader) }
+// Attribute identifies a PC/SC reader or card attribute.
+type Attribute uint32

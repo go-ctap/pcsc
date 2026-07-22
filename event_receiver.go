@@ -1,0 +1,243 @@
+package pcsc
+
+import (
+	"errors"
+	"maps"
+	"slices"
+	"sync"
+	"time"
+)
+
+const (
+	pnpNotificationReader = `\\?PnP?\Notification`
+	eventPollInterval     = time.Second
+)
+
+var getStatusChange = getStatusChangeNative
+
+// nativeReaderState is the platform-independent representation passed to the
+// SCardGetStatusChange ABI adapters.
+type nativeReaderState struct {
+	name         string
+	currentState ReaderState
+	eventState   ReaderState
+	atr          []byte
+}
+
+type eventReceiver struct {
+	events  *deviceEventQueue
+	context scardContext
+	stopped chan struct{}
+
+	mu       sync.Mutex
+	closed   bool
+	runErr   error
+	closeErr error
+
+	closeOnce sync.Once
+}
+
+func (receiver *eventReceiver) Listen() <-chan DeviceEvent {
+	return receiver.events.Listen()
+}
+
+func (receiver *eventReceiver) Close() error {
+	receiver.closeOnce.Do(func() {
+		receiver.mu.Lock()
+		if !receiver.closed {
+			receiver.closed = true
+			cancelErr := cancelNativeContext(receiver.context)
+			if errors.Is(cancelErr, ErrCanceled) {
+				cancelErr = nil
+			}
+			receiver.closeErr = errors.Join(receiver.closeErr, cancelErr)
+		}
+		receiver.mu.Unlock()
+
+		<-receiver.stopped
+	})
+
+	receiver.mu.Lock()
+	defer receiver.mu.Unlock()
+
+	return errors.Join(receiver.runErr, receiver.closeErr)
+}
+
+func (receiver *eventReceiver) recordRunError(err error) {
+	receiver.mu.Lock()
+	defer receiver.mu.Unlock()
+
+	if !receiver.closed || !errors.Is(err, ErrCanceled) {
+		receiver.runErr = errors.Join(receiver.runErr, err)
+	}
+	receiver.closed = true
+}
+
+func (receiver *eventReceiver) run(current map[string]*ReaderInfo, pnpState ReaderState) {
+	defer close(receiver.stopped)
+	defer receiver.events.Close()
+	defer func() {
+		receiver.mu.Lock()
+		receiver.closeErr = errors.Join(receiver.closeErr, releaseNativeContext(receiver.context))
+		receiver.mu.Unlock()
+	}()
+
+	for {
+		states := readerStates(slices.Sorted(maps.Keys(current)), current, pnpState)
+		err := waitForStatusChange(receiver.context, eventPollInterval, states)
+		if err != nil && !errors.Is(err, ErrTimeout) {
+			receiver.recordRunError(err)
+			return
+		}
+
+		receiver.mu.Lock()
+		closed := receiver.closed
+		receiver.mu.Unlock()
+		if closed {
+			return
+		}
+
+		base, nextPnPState := snapshotFromReaderStates(states)
+		next, nextPnPState, err := readerSnapshot(receiver.context, base, nextPnPState)
+		if err != nil {
+			receiver.recordRunError(err)
+			return
+		}
+
+		receiver.mu.Lock()
+		closed = receiver.closed
+		receiver.mu.Unlock()
+		if closed {
+			return
+		}
+
+		for _, event := range reconcileDeviceEvents(current, next) {
+			receiver.events.Send(event)
+		}
+
+		current = next
+		pnpState = nextPnPState
+	}
+}
+
+// Events publishes the current reader and card snapshot followed by live
+// reader and card-presence changes. Each call creates an independent receiver.
+func Events() (EventReceiver, error) {
+	context, err := establishNativeContext()
+	if err != nil {
+		return nil, err
+	}
+
+	current, pnpState, err := readerSnapshot(context, nil, ReaderStateUnaware)
+	if err != nil {
+		return nil, errors.Join(err, releaseNativeContext(context))
+	}
+
+	receiver := &eventReceiver{
+		events:  newDeviceEventQueue(),
+		context: context,
+		stopped: make(chan struct{}),
+	}
+	for _, event := range reconcileDeviceEvents(nil, current) {
+		receiver.events.Send(event)
+	}
+
+	go receiver.run(current, pnpState)
+
+	return receiver, nil
+}
+
+func readerSnapshot(
+	context scardContext,
+	base map[string]*ReaderInfo,
+	pnpState ReaderState,
+) (map[string]*ReaderInfo, ReaderState, error) {
+	names, err := listReadersNative(context)
+	if err != nil {
+		return nil, pnpState, err
+	}
+
+	states := readerStates(names, base, pnpState)
+	err = waitForStatusChange(context, 0, states)
+	if err != nil && !errors.Is(err, ErrTimeout) {
+		return nil, pnpState, err
+	}
+
+	current, nextPnPState := snapshotFromReaderStates(states)
+
+	return current, nextPnPState, nil
+}
+
+// Some PC/SC implementations do not recognize the PnP notification
+// pseudo-reader. Ignoring it preserves card events while the periodic reader
+// snapshot provides a portable hot-plug fallback.
+func waitForStatusChange(
+	context scardContext,
+	timeout time.Duration,
+	states []nativeReaderState,
+) error {
+	err := getStatusChange(context, timeout, states)
+	if !errors.Is(err, ErrUnknownReader) {
+		return err
+	}
+
+	for index := range states {
+		if states[index].name != pnpNotificationReader || states[index].currentState == ReaderStateIgnore {
+			continue
+		}
+
+		states[index].currentState = ReaderStateIgnore
+		states[index].eventState = ReaderStateIgnore
+
+		return getStatusChange(context, timeout, states)
+	}
+
+	return err
+}
+
+func readerStates(
+	names []string,
+	current map[string]*ReaderInfo,
+	pnpState ReaderState,
+) []nativeReaderState {
+	states := make([]nativeReaderState, 0, len(names)+1)
+	for _, name := range names {
+		state := nativeReaderState{name: name}
+		if info := current[name]; info != nil {
+			state.currentState = info.State
+			state.eventState = info.State
+			state.atr = info.ATR
+		}
+
+		states = append(states, state)
+	}
+
+	states = append(states, nativeReaderState{
+		name:         pnpNotificationReader,
+		currentState: pnpState,
+		eventState:   pnpState,
+	})
+
+	return states
+}
+
+func snapshotFromReaderStates(states []nativeReaderState) (map[string]*ReaderInfo, ReaderState) {
+	readers := make(map[string]*ReaderInfo, len(states))
+	var pnpState ReaderState
+
+	for _, state := range states {
+		normalized := state.eventState &^ ReaderStateChanged
+		if state.name == pnpNotificationReader {
+			pnpState = normalized
+			continue
+		}
+
+		readers[state.name] = &ReaderInfo{
+			Name:  state.name,
+			State: normalized,
+			ATR:   state.atr,
+		}
+	}
+
+	return readers, pnpState
+}
