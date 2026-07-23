@@ -3,14 +3,17 @@
 package pcsc
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"os"
 	"testing"
+	"time"
 )
 
 const hardwareTestEnv = "PCSC_TEST_CTAPNFC"
+const lifecycleHardwareTestEnv = "PCSC_TEST"
 
 var (
 	// FIDO application AID, as assigned to the FIDO Alliance.
@@ -23,6 +26,98 @@ var (
 	// support for NFCCTAP_GETRESPONSE status polling.
 	getInfoAPDU = []byte{0x80, 0x10, 0x80, 0x00, 0x01, 0x04, 0x00}
 )
+
+func TestPCSCLifecycle(t *testing.T) {
+	if os.Getenv(lifecycleHardwareTestEnv) != "1" {
+		t.Skip("set " + lifecycleHardwareTestEnv + "=1 to run the hardware test")
+	}
+
+	var readers []*ReaderInfo
+	for reader, err := range Enumerate() {
+		if err != nil {
+			t.Fatalf("Enumerate: %v", err)
+		}
+		readers = append(readers, reader)
+	}
+	if len(readers) == 0 {
+		t.Fatal("no PC/SC readers found")
+	}
+
+	receiver, err := Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	connected := make(map[string]bool, len(readers))
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for len(connected) < len(readers) {
+		select {
+		case event, ok := <-receiver.Listen():
+			if !ok {
+				t.Fatal("event stream closed during initial snapshot")
+			}
+			if event.Err != nil {
+				t.Fatalf("event error: %v", event.Err)
+			}
+			if event.ReaderInfo != nil {
+				t.Logf(
+					"event type=%s reader=%q state=0x%x ATR=%x",
+					event.Type,
+					event.ReaderInfo.Name,
+					event.ReaderInfo.State,
+					event.ReaderInfo.ATR,
+				)
+			}
+			if event.Type == DeviceEventReaderConnected {
+				connected[event.ReaderInfo.Name] = true
+			}
+		case <-deadline.C:
+			t.Fatalf("initial event snapshot reported %d of %d readers", len(connected), len(readers))
+		}
+	}
+	if err := receiver.Close(); err != nil {
+		t.Errorf("close event receiver: %v", err)
+	}
+
+	var opened int
+	for _, reader := range readers {
+		card, err := Open(reader.Name)
+		if errors.Is(err, ErrNoCard) {
+			t.Logf("reader %q has no card", reader.Name)
+			continue
+		}
+		if err != nil {
+			t.Errorf("Open(%q): %v", reader.Name, err)
+			continue
+		}
+		opened++
+
+		status, err := card.Status()
+		if err != nil {
+			t.Errorf("Status(%q): %v", reader.Name, err)
+		} else {
+			t.Logf("reader=%q protocol=%d state=0x%x ATR=%x", status.ReaderName, status.Protocol, status.State, status.ATR)
+
+			atr, attributeErr := card.GetAttribute(AttributeATR)
+			if attributeErr != nil {
+				t.Errorf("GetAttribute(ATR, %q): %v", reader.Name, attributeErr)
+			} else if !bytes.Equal(atr, status.ATR) {
+				t.Errorf("attribute ATR = %x, status ATR = %x", atr, status.ATR)
+			}
+		}
+		if err := card.BeginTransaction(t.Context()); err != nil {
+			t.Errorf("BeginTransaction(%q): %v", reader.Name, err)
+		} else if err := card.EndTransaction(LeaveCard); err != nil {
+			t.Errorf("EndTransaction(%q): %v", reader.Name, err)
+		}
+		if err := card.Close(); err != nil {
+			t.Errorf("Close(%q): %v", reader.Name, err)
+		}
+	}
+	if opened == 0 {
+		t.Fatal("no card could be opened")
+	}
+}
 
 func TestCTAPNFC(t *testing.T) {
 	if os.Getenv(hardwareTestEnv) != "1" {
@@ -43,7 +138,7 @@ func TestCTAPNFC(t *testing.T) {
 	var tested int
 	for _, reader := range readers {
 		card, err := Open(reader.Name)
-		if isNoCardError(err) {
+		if errors.Is(err, ErrNoCard) {
 			t.Logf("reader %q has no card", reader.Name)
 			continue
 		}
@@ -65,7 +160,7 @@ func TestCTAPNFC(t *testing.T) {
 	}
 }
 
-func testCTAPNFCCard(t *testing.T, reader *ReaderInfo, card Card) bool {
+func testCTAPNFCCard(t *testing.T, reader *ReaderInfo, card *Card) bool {
 	t.Helper()
 	ctx := t.Context()
 
@@ -75,8 +170,8 @@ func testCTAPNFCCard(t *testing.T, reader *ReaderInfo, card Card) bool {
 		return false
 	}
 	t.Logf("reader=%q status_reader=%q protocol=%d state=0x%x ATR=%s",
-		reader.Name, status.Reader, status.Protocol, status.State, hex.EncodeToString(status.ATR))
-	if status.Reader == "" {
+		reader.Name, status.ReaderName, status.Protocol, status.State, hex.EncodeToString(status.ATR))
+	if status.ReaderName == "" {
 		t.Errorf("Status(%q) returned an empty reader name", reader.Name)
 	}
 	if len(status.ATR) == 0 {
@@ -129,7 +224,7 @@ func testCTAPNFCCard(t *testing.T, reader *ReaderInfo, card Card) bool {
 	return true
 }
 
-func exchangeISOResponse(ctx context.Context, card Card, command []byte) ([]byte, error) {
+func exchangeISOResponse(ctx context.Context, card *Card, command []byte) ([]byte, error) {
 	response, err := card.Transmit(ctx, command)
 	if err != nil {
 		return nil, err
@@ -155,9 +250,4 @@ func exchangeISOResponse(ctx context.Context, card Card, command []byte) ([]byte
 
 func hasStatusWord(response []byte, sw1, sw2 byte) bool {
 	return len(response) >= 2 && response[len(response)-2] == sw1 && response[len(response)-1] == sw2
-}
-
-func isNoCardError(err error) bool {
-	var pcscErr *Error
-	return errors.As(err, &pcscErr) && pcscErr.Code == 0x8010000c
 }

@@ -11,19 +11,40 @@ Importing the package does not load the native PC/SC runtime. If it is not
 installed, `Enumerate` yields and `Open` returns `pcsc.ErrUnavailable`, so
 applications can keep PC/SC support optional.
 
-The package intentionally exposes only the primitives needed by token clients:
-reader enumeration, connect/disconnect, status/ATR and raw APDU exchange.
+The package exposes the PC/SC reader and card lifecycle needed by hardware-token
+clients:
 
-The opt-in hardware test expects a FIDO authenticator presented to a PC/SC
-reader:
+- reader enumeration and ordered connection events;
+- shared, exclusive and direct card connections;
+- status and ATR inspection;
+- raw APDU and reader-control exchange;
+- transactions and reconnect;
+- reader and card attributes.
+
+It deliberately does not implement ISO 7816 APDU encoding, status-word
+handling, command chaining or application protocols such as CTAP, PIV and
+OpenPGP.
+
+The generic lifecycle hardware test is read-only and works with any connected
+smart card:
+
+```sh
+PCSC_TEST=1 go test -run TestPCSCLifecycle -v
+```
+
+The CTAP-over-NFC hardware test expects a FIDO authenticator presented to a
+PC/SC reader:
 
 ```sh
 PCSC_TEST_CTAPNFC=1 go test -run TestCTAPNFC -v
 ```
 
 ```go
-import "context"
-import "github.com/go-ctap/pcsc"
+import (
+	"context"
+
+	"github.com/go-ctap/pcsc"
+)
 
 ctx := context.Background()
 
@@ -42,7 +63,8 @@ for reader, err := range pcsc.Enumerate() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("reader=%q ATR=%x protocol=%d", status.Reader, status.ATR, status.Protocol)
+
+	log.Printf("reader=%q ATR=%x protocol=%d", status.ReaderName, status.ATR, status.Protocol)
 
 	// SELECT the standard FIDO applet.
 	response, err := card.Transmit(ctx, []byte{
@@ -57,10 +79,36 @@ for reader, err := range pcsc.Enumerate() {
 }
 ```
 
-Canceling an in-flight `Transmit` issues a best-effort `SCardCancel` for the
-card's PC/SC context and returns `ctx.Err()`.
+`Events` first publishes the current reader and card snapshot and then live
+changes. Each receiver owns an independent PC/SC context:
+
+```go
+receiver, err := pcsc.Events()
+if err != nil {
+	log.Fatal(err)
+}
+defer receiver.Close()
+
+for event := range receiver.Listen() {
+	log.Printf("type=%s reader=%q", event.Type, event.ReaderInfo.Name)
+}
+```
+
+Transactions map directly to `SCardBeginTransaction` and
+`SCardEndTransaction`. They prevent other PC/SC applications from interleaving
+commands, but they do not provide rollback:
+
+```go
+if err := card.BeginTransaction(ctx); err != nil {
+	log.Fatal(err)
+}
+defer card.EndTransaction(pcsc.LeaveCard)
+```
+
+Canceling an in-flight contextual operation issues a best-effort `SCardCancel`
+for the card's PC/SC context and returns `ctx.Err()`.
 PC/SC implementations and reader drivers do not consistently guarantee that an
-in-flight APDU can be interrupted, so the native operation may continue after
-`Transmit` returns. The card remains serialized until that operation finishes.
-Do not automatically retry a canceled APDU: the card may already have processed
-it.
+in-flight operation can be interrupted, so it may continue after the Go method
+returns. The card remains serialized until the native call finishes. Do not
+automatically retry a canceled APDU or control request: the device may already
+have processed it.

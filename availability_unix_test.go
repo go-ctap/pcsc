@@ -45,6 +45,15 @@ func TestUnavailableNativeLibraryReturnsError(t *testing.T) {
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Open error = %v, want ErrUnavailable", err)
 	}
+
+	receiver, err := Events()
+	if receiver != nil {
+		t.Fatalf("Events receiver = %#v, want nil", receiver)
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Events error = %v, want ErrUnavailable", err)
+	}
+
 	if loadCalls != 1 {
 		t.Fatalf("native library load calls = %d, want 1", loadCalls)
 	}

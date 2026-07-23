@@ -15,7 +15,15 @@ func TestTransmitDoesNotRetryAfterInsufficientBuffer(t *testing.T) {
 	t.Cleanup(func() { scardTransmit = original })
 
 	calls := 0
-	scardTransmit = func(_ scardHandle, sendPCI *scardIORequest, _ uintptr, _ scardDWORD, _ *scardIORequest, _ uintptr, recvLength *scardDWORD) scardResult {
+	scardTransmit = func(
+		_ scardHandle,
+		sendPCI *scardIORequest,
+		_ uintptr,
+		_ scardDWORD,
+		_ *scardIORequest,
+		_ uintptr,
+		recvLength *scardDWORD,
+	) scardResult {
 		calls++
 		if sendPCI == nil {
 			t.Fatal("send PCI is nil")
@@ -31,7 +39,7 @@ func TestTransmitDoesNotRetryAfterInsufficientBuffer(t *testing.T) {
 		return scardResultFromCodeForTest(scardEInsufficientBuf)
 	}
 
-	c := &card{handle: scardHandle(1), protocol: ProtocolT1}
+	c := &Card{handle: scardHandle(1), protocol: ProtocolT1}
 	response, err := c.Transmit(context.Background(), []byte{0x00, 0xa4, 0x04, 0x00})
 	if response != nil {
 		t.Fatalf("response = %x, want nil", response)
@@ -59,7 +67,15 @@ func TestTransmitCancellationReturnsPromptlyAndCancelsContext(t *testing.T) {
 	finished := make(chan struct{})
 	cancelCalled := make(chan struct{})
 
-	scardTransmit = func(_ scardHandle, _ *scardIORequest, _ uintptr, _ scardDWORD, _ *scardIORequest, _ uintptr, recvLength *scardDWORD) scardResult {
+	scardTransmit = func(
+		_ scardHandle,
+		_ *scardIORequest,
+		_ uintptr,
+		_ scardDWORD,
+		_ *scardIORequest,
+		_ uintptr,
+		recvLength *scardDWORD,
+	) scardResult {
 		close(started)
 		<-release
 		*recvLength = 0
@@ -72,7 +88,7 @@ func TestTransmitCancellationReturnsPromptlyAndCancelsContext(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &card{context: scardContext(1), handle: scardHandle(1), protocol: ProtocolT1}
+	c := &Card{context: scardContext(1), handle: scardHandle(1), protocol: ProtocolT1}
 	result := make(chan error, 1)
 	go func() {
 		_, err := c.Transmit(ctx, []byte{0x00, 0xa4, 0x04, 0x00})
@@ -105,13 +121,21 @@ func TestTransmitDoesNotStartAfterCancellationWhileQueued(t *testing.T) {
 	original := scardTransmit
 	t.Cleanup(func() { scardTransmit = original })
 
-	scardTransmit = func(_ scardHandle, _ *scardIORequest, _ uintptr, _ scardDWORD, _ *scardIORequest, _ uintptr, _ *scardDWORD) scardResult {
+	scardTransmit = func(
+		_ scardHandle,
+		_ *scardIORequest,
+		_ uintptr,
+		_ scardDWORD,
+		_ *scardIORequest,
+		_ uintptr,
+		_ *scardDWORD,
+	) scardResult {
 		t.Fatal("SCardTransmit called after cancellation while waiting for the card")
 		return 0
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &card{handle: scardHandle(1), protocol: ProtocolT1}
+	c := &Card{handle: scardHandle(1), protocol: ProtocolT1}
 	c.mu.Lock()
 
 	result := make(chan error, 1)
