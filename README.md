@@ -3,59 +3,80 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-ctap/pcsc.svg)](https://pkg.go.dev/github.com/go-ctap/pcsc)
 [![Go](https://github.com/go-ctap/pcsc/actions/workflows/go.yml/badge.svg)](https://github.com/go-ctap/pcsc/actions/workflows/go.yml)
 
-Minimal, CGO-free PC/SC access for Go. Windows calls `winscard.dll` through
-`golang.org/x/sys/windows`; macOS loads the PCSC framework and Linux loads
-`libpcsclite.so.1` at runtime through `purego`.
+`go-ctap/pcsc` is a cgo-free Go library for PC/SC smart-card readers. It
+supports Windows, macOS and Linux.
 
-Importing the package does not load the native PC/SC runtime. If it is not
-installed, `Enumerate` yields and `Open` returns `pcsc.ErrUnavailable`, so
-applications can keep PC/SC support optional.
+> [!WARNING]
+> This module is under active development. Its public API may change during `v0.x`.
 
-The package exposes the PC/SC reader and card lifecycle needed by hardware-token
-clients:
+## Support
 
-- reader enumeration and ordered connection events;
-- shared, exclusive and direct card connections;
-- status and ATR inspection;
-- raw APDU and reader-control exchange;
+The package supports:
+
+- reader enumeration and connection events;
+- shared, exclusive and direct connections;
+- card status and ATR;
+- APDU and reader control commands;
 - transactions and reconnect;
 - reader and card attributes.
 
-It deliberately does not implement ISO 7816 APDU encoding, status-word
-handling, command chaining or application protocols such as CTAP, PIV and
-OpenPGP.
+It uses the native PC/SC service on each platform:
 
-The generic lifecycle hardware test is read-only and works with any connected
-smart card:
+| Platform | Backend            |
+|----------|--------------------|
+| Windows  | `winscard.dll`     |
+| macOS    | `PCSC.framework`   |
+| Linux    | `libpcsclite.so.1` |
+
+The native library is loaded on the first PC/SC operation, not during package
+import. If it is not available, the operation returns `pcsc.ErrUnavailable`.
+This lets an application keep PC/SC support optional.
+
+## Installation
 
 ```sh
-PCSC_TEST=1 go test -run TestPCSCLifecycle -v
+go get github.com/go-ctap/pcsc@latest
 ```
 
-The CTAP-over-NFC hardware test expects a FIDO authenticator presented to a
-PC/SC reader:
+See [`go.mod`](go.mod) for the required Go version.
 
-```sh
-PCSC_TEST_CTAPNFC=1 go test -run TestCTAPNFC -v
-```
+## Quick start
+
+This example lists all readers and opens the first one:
 
 ```go
+package main
+
 import (
-	"context"
+	"fmt"
+	"log"
 
 	"github.com/go-ctap/pcsc"
 )
 
-ctx := context.Background()
+func main() {
+	var readerName string
 
-for reader, err := range pcsc.Enumerate() {
-	if err != nil {
-		log.Fatal(err)
+	for reader, err := range pcsc.Enumerate() {
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Printf("reader: %s, state: 0x%x, ATR: %x\n",
+			reader.Name, reader.State, reader.ATR)
+
+		if readerName == "" {
+			readerName = reader.Name
+		}
 	}
 
-	card, err := pcsc.Open(reader.Name)
+	if readerName == "" {
+		log.Fatal("no PC/SC readers found")
+	}
+
+	card, err := pcsc.Open(readerName)
 	if err != nil {
-		continue
+		log.Fatal(err)
 	}
 	defer card.Close()
 
@@ -64,23 +85,67 @@ for reader, err := range pcsc.Enumerate() {
 		log.Fatal(err)
 	}
 
-	log.Printf("readers=%q ATR=%x protocol=%d", status.ReaderNames, status.ATR, status.Protocol)
-
-	// SELECT the standard FIDO applet.
-	response, err := card.Transmit(ctx, []byte{
-		0x00, 0xa4, 0x04, 0x00, 0x08,
-		0xa0, 0x00, 0x00, 0x06, 0x47, 0x2f, 0x00, 0x01,
-		0x00,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("response=%x", response) // response includes SW1/SW2
+	fmt.Printf("protocol: %d, ATR: %x\n", status.Protocol, status.ATR)
 }
 ```
 
-`Events` first publishes the current reader and card snapshot and then live
-changes. Each receiver owns an independent PC/SC context:
+`Open` uses a shared connection, offers T=0 and T=1, and leaves the card
+unchanged on `Close`. These settings can be changed with options:
+
+```go
+card, err := pcsc.Open(
+	readerName,
+	pcsc.WithShareMode(pcsc.ShareModeExclusive),
+	pcsc.WithPreferredProtocols(pcsc.ProtocolT1),
+	pcsc.WithDisconnectDisposition(pcsc.DispositionResetCard),
+)
+```
+
+In direct mode, the default preferred protocol is `ProtocolUndefined`.
+
+## Card operations
+
+`Transmit` sends one raw APDU. The returned data includes the final SW1 and SW2
+status bytes:
+
+```go
+response, err := card.Transmit(ctx, []byte{
+	0x00, 0x84, 0x00, 0x00, 0x08, // GET CHALLENGE
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Printf("response: %x\n", response)
+```
+
+`Control` sends a reader-specific control command. The last argument is the
+expected response-buffer size:
+
+```go
+response, err := card.Control(ctx, pcsc.ControlCode(3400), nil, 4096)
+```
+
+Control commands are not retried automatically because they may have side
+effects.
+
+The package also provides:
+
+- `Status` for reader names, card state, protocol and ATR;
+- `BeginTransaction` and `EndTransaction` for exclusive card access;
+- `Reconnect` for new connection settings or card reset;
+- `GetAttribute` and `SetAttribute` for PC/SC attributes.
+
+## Connection events
+
+`Events` first sends the current reader and card state. It then sends live
+changes in order:
+
+- `DeviceEventReaderConnected`;
+- `DeviceEventReaderDisconnected`;
+- `DeviceEventCardInserted`;
+- `DeviceEventCardRemoved`.
+
+Each event receiver has its own PC/SC context and must be closed:
 
 ```go
 receiver, err := pcsc.Events()
@@ -91,16 +156,21 @@ defer receiver.Close()
 
 for event := range receiver.Listen() {
 	if event.Err != nil {
-		log.Printf("PC/SC event receiver stopped: %v", event.Err)
-		continue
+		log.Printf("PC/SC events stopped: %v", event.Err)
+		break
 	}
-	log.Printf("type=%s reader=%q", event.Type, event.ReaderInfo.Name)
+
+	fmt.Printf("%s: %s\n", event.Type, event.ReaderInfo.Name)
 }
 ```
 
-Transactions map directly to `SCardBeginTransaction` and
-`SCardEndTransaction`. They prevent other PC/SC applications from interleaving
-commands, but they do not provide rollback:
+If the receiver stops because of a PC/SC error, the last event contains that
+error in `DeviceEvent.Err`.
+
+## Transactions
+
+Transactions stop other PC/SC applications from sending commands between your
+operations:
 
 ```go
 if err := card.BeginTransaction(ctx); err != nil {
@@ -109,17 +179,89 @@ if err := card.BeginTransaction(ctx); err != nil {
 defer card.EndTransaction(pcsc.DispositionLeaveCard)
 ```
 
-Canceling an in-flight contextual operation returns `ctx.Err()` promptly. On
-Windows the package also asks `SCardCancel` to interrupt the native call.
-pcsc-lite and Apple's PCSC framework only guarantee cancellation of
-`SCardGetStatusChange`, so APDU, control and transaction calls may continue
-after the Go method returns on those platforms. The card remains serialized
-until the native call finishes, and `Close` waits for it before releasing the
-native handles. Do not automatically retry a canceled APDU or control request:
-the device may already have processed it.
+A transaction does not provide rollback. The disposition passed to
+`EndTransaction` only tells PC/SC what to do with the card.
 
-`Control` requires the expected response-buffer size explicitly. Control
-requests are never retried automatically because they may have side effects.
+## Cancellation and concurrency
 
-`CardStatus.ReaderNames` preserves the complete multi-string returned by
-`SCardStatus`.
+One `Card` runs one operation at a time. A call waiting for another operation
+can be canceled through its context.
+
+On Windows, the package asks PC/SC to cancel an active card operation. On
+macOS and Linux, an APDU, control or transaction call may continue in the
+background after the Go method returns `ctx.Err()`. The card stays locked until
+the native call ends, and `Close` waits for it.
+
+Do not retry a canceled APDU or control command automatically. The card or
+reader may already have processed it.
+
+## Errors
+
+PC/SC errors support `errors.Is` with the package error values:
+
+```go
+if errors.Is(err, pcsc.ErrNoCard) {
+	log.Print("insert a smart card")
+}
+```
+
+The original PC/SC result is available as `*pcsc.Error`. It contains the failed
+operation and the native result code:
+
+```go
+var pcscErr *pcsc.Error
+if errors.As(err, &pcscErr) {
+	log.Printf("%s failed with 0x%08x", pcscErr.Operation, pcscErr.Code)
+}
+```
+
+Common errors include `ErrUnavailable`, `ErrNoReaders`, `ErrNoCard`,
+`ErrCardReset`, `ErrCardRemoved` and `ErrClosed`.
+
+## Platform notes
+
+- `CardState` values are platform-specific. Windows uses an enum. macOS and
+  Linux use a bitmask.
+- `ProtocolRaw` has a different native value on Windows and Unix systems.
+- Direct connections have small platform differences. Use the Go constants
+  instead of hard-coded native values.
+- Linux needs pcsc-lite, a running `pcscd` service and permission to access the
+  reader.
+
+## Scope
+
+This package provides low-level PC/SC access. It does not provide:
+
+- ISO 7816 APDU encoding;
+- status-word processing;
+- `GET RESPONSE` or command chaining;
+- application protocols such as CTAP, PIV or OpenPGP.
+
+Use [`go-ctap/ctap`](https://github.com/go-ctap/ctap) for FIDO2 commands and
+[`go-ctap/token2`](https://github.com/go-ctap/token2) for Token2 device support.
+
+## Testing
+
+Run the normal test suite without hardware:
+
+```sh
+go test ./...
+```
+
+The generic hardware test is read-only and works with any connected smart
+card:
+
+```sh
+PCSC_TEST=1 go test -run TestPCSCLifecycle -v
+```
+
+The CTAP-over-NFC test needs a FIDO authenticator connected through a PC/SC
+reader:
+
+```sh
+PCSC_TEST_CTAPNFC=1 go test -run TestCTAPNFC -v
+```
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).
