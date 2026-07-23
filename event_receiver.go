@@ -1,3 +1,5 @@
+//go:build darwin || linux || windows
+
 package pcsc
 
 import (
@@ -15,9 +17,9 @@ const (
 
 var getStatusChange = getStatusChangeNative
 
-// nativeReaderState is the platform-independent representation passed to the
+// readerState is the platform-independent representation passed to the
 // SCardGetStatusChange ABI adapters.
-type nativeReaderState struct {
+type readerState struct {
 	name         string
 	currentState ReaderState
 	eventState   ReaderState
@@ -54,6 +56,7 @@ func (receiver *eventReceiver) Close() error {
 		}
 		receiver.mu.Unlock()
 
+		receiver.events.Close()
 		<-receiver.stopped
 	})
 
@@ -63,14 +66,17 @@ func (receiver *eventReceiver) Close() error {
 	return errors.Join(receiver.runErr, receiver.closeErr)
 }
 
-func (receiver *eventReceiver) recordRunError(err error) {
+func (receiver *eventReceiver) recordRunError(err error) bool {
 	receiver.mu.Lock()
 	defer receiver.mu.Unlock()
 
-	if !receiver.closed || !errors.Is(err, ErrCanceled) {
+	report := !receiver.closed || !errors.Is(err, ErrCanceled)
+	if report {
 		receiver.runErr = errors.Join(receiver.runErr, err)
 	}
 	receiver.closed = true
+
+	return report
 }
 
 func (receiver *eventReceiver) run(current map[string]*ReaderInfo, pnpState ReaderState) {
@@ -86,7 +92,9 @@ func (receiver *eventReceiver) run(current map[string]*ReaderInfo, pnpState Read
 		states := readerStates(slices.Sorted(maps.Keys(current)), current, pnpState)
 		err := waitForStatusChange(receiver.context, eventPollInterval, states)
 		if err != nil && !errors.Is(err, ErrTimeout) {
-			receiver.recordRunError(err)
+			if receiver.recordRunError(err) {
+				receiver.events.SendTerminal(DeviceEvent{Err: err})
+			}
 			return
 		}
 
@@ -100,7 +108,9 @@ func (receiver *eventReceiver) run(current map[string]*ReaderInfo, pnpState Read
 		base, nextPnPState := snapshotFromReaderStates(states)
 		next, nextPnPState, err := readerSnapshot(receiver.context, base, nextPnPState)
 		if err != nil {
-			receiver.recordRunError(err)
+			if receiver.recordRunError(err) {
+				receiver.events.SendTerminal(DeviceEvent{Err: err})
+			}
 			return
 		}
 
@@ -174,7 +184,7 @@ func readerSnapshot(
 func waitForStatusChange(
 	context scardContext,
 	timeout time.Duration,
-	states []nativeReaderState,
+	states []readerState,
 ) error {
 	err := getStatusChange(context, timeout, states)
 	if !errors.Is(err, ErrUnknownReader) {
@@ -199,10 +209,10 @@ func readerStates(
 	names []string,
 	current map[string]*ReaderInfo,
 	pnpState ReaderState,
-) []nativeReaderState {
-	states := make([]nativeReaderState, 0, len(names)+1)
+) []readerState {
+	states := make([]readerState, 0, len(names)+1)
 	for _, name := range names {
-		state := nativeReaderState{name: name}
+		state := readerState{name: name}
 		if info := current[name]; info != nil {
 			state.currentState = info.State
 			state.eventState = info.State
@@ -212,7 +222,7 @@ func readerStates(
 		states = append(states, state)
 	}
 
-	states = append(states, nativeReaderState{
+	states = append(states, readerState{
 		name:         pnpNotificationReader,
 		currentState: pnpState,
 		eventState:   pnpState,
@@ -221,7 +231,7 @@ func readerStates(
 	return states
 }
 
-func snapshotFromReaderStates(states []nativeReaderState) (map[string]*ReaderInfo, ReaderState) {
+func snapshotFromReaderStates(states []readerState) (map[string]*ReaderInfo, ReaderState) {
 	readers := make(map[string]*ReaderInfo, len(states))
 	var pnpState ReaderState
 

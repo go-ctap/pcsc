@@ -35,3 +35,31 @@ func TestPCSCErrorMatchesStableErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestEveryDocumentedErrorCodeHasStableError(t *testing.T) {
+	for _, table := range []map[uint32]errorInfo{errorsByCode, platformErrorsByCode} {
+		for code, info := range table {
+			err := pcscError("test", code)
+			if !errors.Is(err, info.err) {
+				t.Errorf("pcscError(0x%08x) = %v, want errors.Is(_, %v)", code, err, info.err)
+			}
+		}
+	}
+}
+
+func TestUnsupportedFeatureUsesPlatformCode(t *testing.T) {
+	err := pcscError("test", unsupportedFeatureCode)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("pcscError(0x%08x) = %v, want ErrUnsupportedFeature", unsupportedFeatureCode, err)
+	}
+
+	if unsupportedFeatureCode == 0x8010001f && !errors.Is(err, ErrUnexpected) {
+		t.Fatalf("pcsc-lite collision no longer matches ErrUnexpected: %v", err)
+	}
+}
+
+func TestPCSCErrorDoesNotMatchNil(t *testing.T) {
+	if errors.Is(pcscError("test", 0x80100002), nil) {
+		t.Fatal("mapped PC/SC error unexpectedly matches nil")
+	}
+}

@@ -1,7 +1,6 @@
 package pcsc
 
 import (
-	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -160,55 +159,5 @@ func TestReconcileDeviceEvents(t *testing.T) {
 				t.Fatalf("event types = %v, want %v", got, test.want)
 			}
 		})
-	}
-}
-
-func TestSnapshotFromReaderStatesNormalizesChangedBit(t *testing.T) {
-	states := []nativeReaderState{
-		{name: "reader", eventState: ReaderStateChanged | ReaderStatePresent, atr: []byte{1, 2}},
-		{name: pnpNotificationReader, eventState: ReaderStateChanged | ReaderStateUnknown},
-	}
-	readers, pnpState := snapshotFromReaderStates(states)
-	if got := readers["reader"].State; got != ReaderStatePresent {
-		t.Fatalf("reader state = 0x%x, want 0x%x", got, ReaderStatePresent)
-	}
-	if pnpState != ReaderStateUnknown {
-		t.Fatalf("PnP state = 0x%x, want 0x%x", pnpState, ReaderStateUnknown)
-	}
-}
-
-func TestStatusChangeFallsBackWhenPnPReaderIsUnsupported(t *testing.T) {
-	original := getStatusChange
-	t.Cleanup(func() { getStatusChange = original })
-
-	calls := 0
-	getStatusChange = func(_ scardContext, _ time.Duration, states []nativeReaderState) error {
-		calls++
-		pnp := &states[len(states)-1]
-		if calls == 1 {
-			if pnp.currentState != ReaderStateUnaware {
-				t.Fatalf("initial PnP state = 0x%x, want unaware", pnp.currentState)
-			}
-
-			return &Error{Operation: "SCardGetStatusChange", Code: 0x80100009}
-		}
-
-		if pnp.currentState != ReaderStateIgnore {
-			t.Fatalf("fallback PnP state = 0x%x, want ignore", pnp.currentState)
-		}
-
-		return ErrTimeout
-	}
-
-	states := []nativeReaderState{
-		{name: "reader"},
-		{name: pnpNotificationReader},
-	}
-	err := waitForStatusChange(scardContext(1), 0, states)
-	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf("waitForStatusChange error = %v, want ErrTimeout", err)
-	}
-	if calls != 2 {
-		t.Fatalf("status-change calls = %d, want 2", calls)
 	}
 }

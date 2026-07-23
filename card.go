@@ -3,8 +3,10 @@
 package pcsc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -12,27 +14,75 @@ import (
 
 const (
 	scardEInsufficientBuf = uint32(0x80100008)
-	maxResponseBufSize    = 65538
+	maxAPDUResponseSize   = 65538
 )
+
+var cancelCardOperation = cancelNativeCardOperation
 
 type scardIORequest struct {
 	Protocol scardDWORD
 	Length   scardDWORD
 }
 
-// Card is a connection to a smart card. Context cancellation is best-effort:
-// a driver may continue an in-flight operation after the method returns.
+// Card is a connection to a smart card. Context cancellation returns promptly,
+// but the native operation may continue in the background on implementations
+// that cannot cancel card operations, including pcsc-lite.
 type Card struct {
-	mu                    sync.Mutex
+	operationOnce         sync.Once
+	operationGate         chan struct{}
+	stateMu               sync.RWMutex
 	context               scardContext
 	handle                scardHandle
 	protocol              Protocol
 	disconnectDisposition Disposition
 	closed                bool
+	closeOnce             sync.Once
+	closeErr              error
 }
 
 func scardError(operation string, result scardResult) error {
 	return pcscError(operation, uint32(result))
+}
+
+func (card *Card) isClosed() bool {
+	card.stateMu.RLock()
+	defer card.stateMu.RUnlock()
+
+	return card.closed
+}
+
+func (card *Card) cancelOperation() error {
+	card.stateMu.RLock()
+	defer card.stateMu.RUnlock()
+
+	if card.closed {
+		return nil
+	}
+
+	return cancelCardOperation(card.context)
+}
+
+func (card *Card) lockOperation(ctx context.Context) error {
+	card.operationOnce.Do(func() {
+		card.operationGate = make(chan struct{}, 1)
+		card.operationGate <- struct{}{}
+	})
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-card.operationGate:
+		if err := ctx.Err(); err != nil {
+			card.unlockOperation()
+			return err
+		}
+
+		return nil
+	}
+}
+
+func (card *Card) unlockOperation() {
+	card.operationGate <- struct{}{}
 }
 
 func runCardOperation[T any](
@@ -42,16 +92,12 @@ func runCardOperation[T any](
 ) (T, error) {
 	var zero T
 
-	card.mu.Lock()
-
-	if err := ctx.Err(); err != nil {
-		card.mu.Unlock()
-
+	if err := card.lockOperation(ctx); err != nil {
 		return zero, err
 	}
 
-	if card.closed {
-		card.mu.Unlock()
+	if card.isClosed() {
+		card.unlockOperation()
 
 		return zero, ErrClosed
 	}
@@ -62,7 +108,7 @@ func runCardOperation[T any](
 	}
 	result := make(chan operationResult, 1)
 	go func() {
-		defer card.mu.Unlock()
+		defer card.unlockOperation()
 
 		value, err := operation()
 		result <- operationResult{value: value, err: err}
@@ -70,7 +116,7 @@ func runCardOperation[T any](
 
 	select {
 	case <-ctx.Done():
-		_ = cancelNativeContext(card.context)
+		_ = card.cancelOperation()
 		return zero, ctx.Err()
 	case result := <-result:
 		return result.value, result.err
@@ -80,16 +126,12 @@ func runCardOperation[T any](
 // BeginTransaction prevents other PC/SC applications from interleaving card
 // operations until EndTransaction is called.
 func (card *Card) BeginTransaction(ctx context.Context) error {
-	card.mu.Lock()
-
-	if err := ctx.Err(); err != nil {
-		card.mu.Unlock()
-
+	if err := card.lockOperation(ctx); err != nil {
 		return err
 	}
 
-	if card.closed {
-		card.mu.Unlock()
+	if card.isClosed() {
+		card.unlockOperation()
 
 		return ErrClosed
 	}
@@ -98,7 +140,7 @@ func (card *Card) BeginTransaction(ctx context.Context) error {
 	accepted := make(chan struct{})
 	abandoned := make(chan struct{})
 	go func() {
-		defer card.mu.Unlock()
+		defer card.unlockOperation()
 
 		err := scardError("SCardBeginTransaction", scardBeginTransaction(card.handle))
 		select {
@@ -107,12 +149,12 @@ func (card *Card) BeginTransaction(ctx context.Context) error {
 			case <-accepted:
 			case <-abandoned:
 				if err == nil {
-					_ = scardEndTransaction(card.handle, scardDWORD(LeaveCard))
+					_ = scardEndTransaction(card.handle, scardDWORD(DispositionLeaveCard))
 				}
 			}
 		case <-abandoned:
 			if err == nil {
-				_ = scardEndTransaction(card.handle, scardDWORD(LeaveCard))
+				_ = scardEndTransaction(card.handle, scardDWORD(DispositionLeaveCard))
 			}
 		}
 	}()
@@ -120,7 +162,7 @@ func (card *Card) BeginTransaction(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		close(abandoned)
-		_ = cancelNativeContext(card.context)
+		_ = card.cancelOperation()
 
 		return ctx.Err()
 	case err := <-result:
@@ -132,10 +174,10 @@ func (card *Card) BeginTransaction(ctx context.Context) error {
 
 // EndTransaction releases a transaction and applies disposition to the card.
 func (card *Card) EndTransaction(disposition Disposition) error {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	_ = card.lockOperation(context.Background())
+	defer card.unlockOperation()
 
-	if card.closed {
+	if card.isClosed() {
 		return ErrClosed
 	}
 
@@ -153,6 +195,10 @@ func (card *Card) Reconnect(
 	initialization Disposition,
 ) (Protocol, error) {
 	return runCardOperation(card, ctx, func() (Protocol, error) {
+		if err := validateReconnectParameters(shareMode, initialization); err != nil {
+			return ProtocolUndefined, err
+		}
+
 		var protocol scardDWORD
 		result := scardReconnect(
 			card.handle,
@@ -171,15 +217,41 @@ func (card *Card) Reconnect(
 	})
 }
 
+func validateReconnectParameters(shareMode ShareMode, initialization Disposition) error {
+	switch shareMode {
+	case ShareModeShared, ShareModeExclusive:
+	case ShareModeDirect:
+		if !reconnectSupportsDirect {
+			return fmt.Errorf("%w: reconnect share mode %d", ErrInvalidValue, shareMode)
+		}
+	default:
+		return fmt.Errorf("%w: reconnect share mode %d", ErrInvalidValue, shareMode)
+	}
+
+	switch initialization {
+	case DispositionLeaveCard, DispositionResetCard, DispositionUnpowerCard:
+	case DispositionEjectCard:
+		if !reconnectSupportsEject {
+			return fmt.Errorf("%w: reconnect disposition %d", ErrInvalidValue, initialization)
+		}
+	default:
+		return fmt.Errorf("%w: reconnect disposition %d", ErrInvalidValue, initialization)
+	}
+
+	return nil
+}
+
 // Transmit sends one raw APDU and returns the complete response, including
 // SW1/SW2.
 func (card *Card) Transmit(ctx context.Context, apdu []byte) ([]byte, error) {
+	apdu = bytes.Clone(apdu)
+
 	return runCardOperation(card, ctx, func() ([]byte, error) {
 		request := scardIORequest{
 			Protocol: scardDWORD(card.protocol),
 			Length:   scardDWORD(unsafe.Sizeof(scardIORequest{})),
 		}
-		response := make([]byte, maxResponseBufSize)
+		response := make([]byte, maxAPDUResponseSize)
 		size := scardDWORD(len(response))
 		result := scardTransmit(
 			card.handle,
@@ -199,14 +271,26 @@ func (card *Card) Transmit(ctx context.Context, apdu []byte) ([]byte, error) {
 	})
 }
 
-// Control sends a reader-specific control request.
+// Control sends a reader-specific control request using an output buffer of
+// responseSize bytes. It does not retry the request because a control operation
+// may have side effects.
 func (card *Card) Control(
 	ctx context.Context,
 	controlCode uint32,
 	input []byte,
+	responseSize int,
 ) ([]byte, error) {
+	if responseSize < 0 || uint64(responseSize) > uint64(^scardDWORD(0)) {
+		return nil, fmt.Errorf("%w: control response size %d", ErrInvalidParameter, responseSize)
+	}
+	if uint64(len(input)) > uint64(^scardDWORD(0)) {
+		return nil, fmt.Errorf("%w: control input size %d", ErrInvalidParameter, len(input))
+	}
+
+	input = bytes.Clone(input)
+
 	return runCardOperation(card, ctx, func() ([]byte, error) {
-		response := make([]byte, maxResponseBufSize)
+		response := make([]byte, responseSize)
 		var size scardDWORD
 		result := scardControl(
 			card.handle,
@@ -221,17 +305,25 @@ func (card *Card) Control(
 		if err := scardError("SCardControl", result); err != nil {
 			return nil, err
 		}
+		if uint64(size) > uint64(len(response)) {
+			return nil, fmt.Errorf(
+				"%w: SCardControl returned %d bytes for a %d-byte buffer",
+				ErrInsufficientBuffer,
+				size,
+				len(response),
+			)
+		}
 
-		return response[:min(int(size), len(response))], nil
+		return response[:int(size)], nil
 	})
 }
 
 // GetAttribute returns a reader or card attribute.
 func (card *Card) GetAttribute(attribute Attribute) ([]byte, error) {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	_ = card.lockOperation(context.Background())
+	defer card.unlockOperation()
 
-	if card.closed {
+	if card.isClosed() {
 		return nil, ErrClosed
 	}
 
@@ -255,10 +347,10 @@ func (card *Card) GetAttribute(attribute Attribute) ([]byte, error) {
 
 // SetAttribute sets a reader or card attribute.
 func (card *Card) SetAttribute(attribute Attribute, value []byte) error {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	_ = card.lockOperation(context.Background())
+	defer card.unlockOperation()
 
-	if card.closed {
+	if card.isClosed() {
 		return ErrClosed
 	}
 
@@ -273,23 +365,33 @@ func (card *Card) SetAttribute(attribute Attribute, value []byte) error {
 	return scardError("SCardSetAttrib", result)
 }
 
-// Close disconnects from the card and releases its PC/SC context.
+// Close prevents new operations, asks the native implementation to cancel an
+// in-flight card operation when supported, waits for it to finish, disconnects
+// from the card, and releases its PC/SC context.
 func (card *Card) Close() error {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	card.closeOnce.Do(func() {
+		card.stateMu.Lock()
+		card.closed = true
+		cancelErr := cancelCardOperation(card.context)
+		card.stateMu.Unlock()
+		if errors.Is(cancelErr, ErrCanceled) {
+			cancelErr = nil
+		}
 
-	if card.closed {
-		return nil
-	}
-	card.closed = true
+		_ = card.lockOperation(context.Background())
+		defer card.unlockOperation()
 
-	return errors.Join(
-		scardError(
-			"SCardDisconnect",
-			scardDisconnect(card.handle, scardDWORD(card.disconnectDisposition)),
-		),
-		releaseNativeContext(card.context),
-	)
+		card.closeErr = errors.Join(
+			cancelErr,
+			scardError(
+				"SCardDisconnect",
+				scardDisconnect(card.handle, scardDWORD(card.disconnectDisposition)),
+			),
+			releaseNativeContext(card.context),
+		)
+	})
+
+	return card.closeErr
 }
 
 func byteSlicePointer(value []byte) uintptr {

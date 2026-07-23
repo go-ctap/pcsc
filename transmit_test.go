@@ -31,8 +31,8 @@ func TestTransmitDoesNotRetryAfterInsufficientBuffer(t *testing.T) {
 		if got, want := sendPCI.Length, scardDWORD(unsafe.Sizeof(*sendPCI)); got != want {
 			t.Errorf("send PCI length = %d, want %d", got, want)
 		}
-		if got := *recvLength; got != scardDWORD(maxResponseBufSize) {
-			t.Errorf("receive buffer size = %d, want %d", got, maxResponseBufSize)
+		if got := *recvLength; got != scardDWORD(maxAPDUResponseSize) {
+			t.Errorf("receive buffer size = %d, want %d", got, maxAPDUResponseSize)
 		}
 
 		*recvLength = 8192
@@ -54,12 +54,12 @@ func TestTransmitDoesNotRetryAfterInsufficientBuffer(t *testing.T) {
 	}
 }
 
-func TestTransmitCancellationReturnsPromptlyAndCancelsContext(t *testing.T) {
+func TestTransmitCancellationReturnsPromptlyAndRequestsNativeCancellation(t *testing.T) {
 	originalTransmit := scardTransmit
-	originalCancel := scardCancel
+	originalCancel := cancelCardOperation
 	t.Cleanup(func() {
 		scardTransmit = originalTransmit
-		scardCancel = originalCancel
+		cancelCardOperation = originalCancel
 	})
 
 	started := make(chan struct{})
@@ -82,9 +82,9 @@ func TestTransmitCancellationReturnsPromptlyAndCancelsContext(t *testing.T) {
 		close(finished)
 		return 0
 	}
-	scardCancel = func(_ scardContext) scardResult {
+	cancelCardOperation = func(_ scardContext) error {
 		close(cancelCalled)
-		return 0
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -110,11 +110,67 @@ func TestTransmitCancellationReturnsPromptlyAndCancelsContext(t *testing.T) {
 	select {
 	case <-cancelCalled:
 	case <-time.After(time.Second):
-		t.Fatal("SCardCancel was not called")
+		t.Fatal("native cancellation was not requested")
 	}
 
 	close(release)
 	<-finished
+}
+
+func TestTransmitOwnsInputAfterCancellation(t *testing.T) {
+	originalTransmit := scardTransmit
+	originalCancel := cancelCardOperation
+	t.Cleanup(func() {
+		scardTransmit = originalTransmit
+		cancelCardOperation = originalCancel
+	})
+
+	started := make(chan struct{})
+	readInput := make(chan struct{})
+	observed := make(chan uintptr, 1)
+	scardTransmit = func(
+		_ scardHandle,
+		_ *scardIORequest,
+		sendBuffer uintptr,
+		sendLength scardDWORD,
+		_ *scardIORequest,
+		_ uintptr,
+		receiveLength *scardDWORD,
+	) scardResult {
+		close(started)
+		<-readInput
+		if sendLength != 4 {
+			t.Errorf("send length = %d, want 4", sendLength)
+		}
+		observed <- sendBuffer
+		*receiveLength = 0
+		return 0
+	}
+	cancelCardOperation = func(scardContext) error { return nil }
+
+	apdu := []byte{1, 2, 3, 4}
+	inputPointer := byteSlicePointer(apdu)
+	ctx, cancel := context.WithCancel(context.Background())
+	card := &Card{context: scardContext(1), handle: scardHandle(1), protocol: ProtocolT1}
+	result := make(chan error, 1)
+	go func() {
+		_, err := card.Transmit(ctx, apdu)
+		result <- err
+	}()
+
+	<-started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Transmit error = %v, want context.Canceled", err)
+	}
+	for index := range apdu {
+		apdu[index] = 0xff
+	}
+	close(readInput)
+
+	if got := <-observed; got == inputPointer {
+		t.Fatal("native call retained the caller's APDU buffer")
+	}
 }
 
 func TestTransmitDoesNotStartAfterCancellationWhileQueued(t *testing.T) {
@@ -136,7 +192,9 @@ func TestTransmitDoesNotStartAfterCancellationWhileQueued(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Card{handle: scardHandle(1), protocol: ProtocolT1}
-	c.mu.Lock()
+	if err := c.lockOperation(context.Background()); err != nil {
+		t.Fatalf("lockOperation: %v", err)
+	}
 
 	result := make(chan error, 1)
 	go func() {
@@ -145,11 +203,15 @@ func TestTransmitDoesNotStartAfterCancellationWhileQueued(t *testing.T) {
 	}()
 
 	cancel()
-	c.mu.Unlock()
-	err := <-result
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context.Canceled", err)
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Transmit did not return after cancellation while waiting for the card")
 	}
+	c.unlockOperation()
 }
 
 func scardResultFromCodeForTest(code uint32) scardResult {

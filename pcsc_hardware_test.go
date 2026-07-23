@@ -96,9 +96,9 @@ func TestPCSCLifecycle(t *testing.T) {
 		if err != nil {
 			t.Errorf("Status(%q): %v", reader.Name, err)
 		} else {
-			t.Logf("reader=%q protocol=%d state=0x%x ATR=%x", status.ReaderName, status.Protocol, status.State, status.ATR)
+			t.Logf("readers=%q protocol=%d state=0x%x ATR=%x", status.ReaderNames, status.Protocol, status.State, status.ATR)
 
-			atr, attributeErr := card.GetAttribute(AttributeATR)
+			atr, attributeErr := card.GetAttribute(AttributeATRString)
 			if attributeErr != nil {
 				t.Errorf("GetAttribute(ATR, %q): %v", reader.Name, attributeErr)
 			} else if !bytes.Equal(atr, status.ATR) {
@@ -107,7 +107,7 @@ func TestPCSCLifecycle(t *testing.T) {
 		}
 		if err := card.BeginTransaction(t.Context()); err != nil {
 			t.Errorf("BeginTransaction(%q): %v", reader.Name, err)
-		} else if err := card.EndTransaction(LeaveCard); err != nil {
+		} else if err := card.EndTransaction(DispositionLeaveCard); err != nil {
 			t.Errorf("EndTransaction(%q): %v", reader.Name, err)
 		}
 		if err := card.Close(); err != nil {
@@ -169,9 +169,9 @@ func testCTAPNFCCard(t *testing.T, reader *ReaderInfo, card *Card) bool {
 		t.Errorf("Status(%q): %v", reader.Name, err)
 		return false
 	}
-	t.Logf("reader=%q status_reader=%q protocol=%d state=0x%x ATR=%s",
-		reader.Name, status.ReaderName, status.Protocol, status.State, hex.EncodeToString(status.ATR))
-	if status.ReaderName == "" {
+	t.Logf("reader=%q status_readers=%q protocol=%d state=0x%x ATR=%s",
+		reader.Name, status.ReaderNames, status.Protocol, status.State, hex.EncodeToString(status.ATR))
+	if len(status.ReaderNames) == 0 {
 		t.Errorf("Status(%q) returned an empty reader name", reader.Name)
 	}
 	if len(status.ATR) == 0 {

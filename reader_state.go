@@ -1,3 +1,5 @@
+//go:build darwin || linux || windows
+
 package pcsc
 
 import (
@@ -45,7 +47,7 @@ func newNativeReaderStateLayout(atrSize int, packed bool) nativeReaderStateLayou
 	}
 }
 
-func (layout nativeReaderStateLayout) encode(states []nativeReaderState, namePointers []uintptr) []byte {
+func (layout nativeReaderStateLayout) encode(states []readerState, namePointers []uintptr) []byte {
 	buffer := make([]byte, layout.stride*len(states))
 
 	for index, state := range states {
@@ -72,7 +74,7 @@ func (layout nativeReaderStateLayout) encode(states []nativeReaderState, namePoi
 	return buffer
 }
 
-func (layout nativeReaderStateLayout) decode(buffer []byte, states []nativeReaderState) {
+func (layout nativeReaderStateLayout) decode(buffer []byte, states []readerState) {
 	for index := range states {
 		entry := buffer[index*layout.stride:]
 
@@ -115,7 +117,9 @@ func durationMilliseconds(duration time.Duration) uint32 {
 
 	milliseconds := duration.Milliseconds()
 	if milliseconds >= int64(^uint32(0)) {
-		return ^uint32(0)
+		// 0xffffffff is reserved by PC/SC for INFINITE. Keep every finite
+		// duration finite when converting it to the native DWORD.
+		return ^uint32(0) - 1
 	}
 
 	return uint32(milliseconds)

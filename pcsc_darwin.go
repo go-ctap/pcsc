@@ -2,7 +2,12 @@
 
 package pcsc
 
-const pcscLibrary = "/System/Library/Frameworks/PCSC.framework/PCSC"
+const (
+	pcscLibrary             = "/System/Library/Frameworks/PCSC.framework/PCSC"
+	scardControlSymbol      = "SCardControl132"
+	reconnectSupportsDirect = true
+	reconnectSupportsEject  = true
+)
 
 const (
 	scardReaderStateATRSize = 33

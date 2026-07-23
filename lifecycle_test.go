@@ -11,11 +11,11 @@ import (
 
 func TestBeginTransactionCancellationReturnsPromptly(t *testing.T) {
 	originalBegin := scardBeginTransaction
-	originalCancel := scardCancel
+	originalCancel := cancelCardOperation
 	originalEnd := scardEndTransaction
 	t.Cleanup(func() {
 		scardBeginTransaction = originalBegin
-		scardCancel = originalCancel
+		cancelCardOperation = originalCancel
 		scardEndTransaction = originalEnd
 	})
 
@@ -30,14 +30,14 @@ func TestBeginTransactionCancellationReturnsPromptly(t *testing.T) {
 
 		return 0
 	}
-	scardCancel = func(scardContext) scardResult {
+	cancelCardOperation = func(scardContext) error {
 		close(cancelCalled)
 
-		return 0
+		return nil
 	}
 	scardEndTransaction = func(_ scardHandle, disposition scardDWORD) scardResult {
-		if disposition != scardDWORD(LeaveCard) {
-			t.Errorf("cleanup disposition = %d, want %d", disposition, LeaveCard)
+		if disposition != scardDWORD(DispositionLeaveCard) {
+			t.Errorf("cleanup disposition = %d, want %d", disposition, DispositionLeaveCard)
 		}
 		close(cleanupCalled)
 
@@ -66,7 +66,7 @@ func TestBeginTransactionCancellationReturnsPromptly(t *testing.T) {
 	select {
 	case <-cancelCalled:
 	case <-time.After(time.Second):
-		t.Fatal("SCardCancel was not called")
+		t.Fatal("native cancellation was not requested")
 	}
 
 	close(release)
@@ -74,6 +74,94 @@ func TestBeginTransactionCancellationReturnsPromptly(t *testing.T) {
 	case <-cleanupCalled:
 	case <-time.After(time.Second):
 		t.Fatal("late successful transaction was not ended")
+	}
+}
+
+func TestCloseCancelsInFlightOperation(t *testing.T) {
+	originalTransmit := scardTransmit
+	originalCancel := cancelCardOperation
+	originalDisconnect := scardDisconnect
+	originalRelease := scardReleaseContext
+	t.Cleanup(func() {
+		scardTransmit = originalTransmit
+		cancelCardOperation = originalCancel
+		scardDisconnect = originalDisconnect
+		scardReleaseContext = originalRelease
+	})
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	scardTransmit = func(
+		_ scardHandle,
+		_ *scardIORequest,
+		_ uintptr,
+		_ scardDWORD,
+		_ *scardIORequest,
+		_ uintptr,
+		receiveLength *scardDWORD,
+	) scardResult {
+		close(started)
+		<-canceled
+		*receiveLength = 0
+		return 0
+	}
+	cancelCardOperation = func(scardContext) error {
+		close(canceled)
+		return nil
+	}
+
+	disconnected := false
+	scardDisconnect = func(_ scardHandle, disposition scardDWORD) scardResult {
+		disconnected = true
+		if disposition != scardDWORD(DispositionResetCard) {
+			t.Errorf("disconnect disposition = %d, want %d", disposition, DispositionResetCard)
+		}
+		return 0
+	}
+
+	released := false
+	scardReleaseContext = func(scardContext) scardResult {
+		released = true
+		return 0
+	}
+
+	card := &Card{
+		context:               scardContext(1),
+		handle:                scardHandle(1),
+		protocol:              ProtocolT1,
+		disconnectDisposition: DispositionResetCard,
+	}
+	transmitResult := make(chan error, 1)
+	go func() {
+		_, err := card.Transmit(context.Background(), []byte{1})
+		transmitResult <- err
+	}()
+	<-started
+
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- card.Close()
+	}()
+
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel the in-flight operation")
+	}
+	if err := <-transmitResult; err != nil {
+		t.Fatalf("Transmit: %v", err)
+	}
+	if !disconnected {
+		t.Fatal("SCardDisconnect was not called")
+	}
+	if !released {
+		t.Fatal("SCardReleaseContext was not called")
+	}
+	if err := card.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
@@ -89,11 +177,11 @@ func TestEndTransactionForwardsDisposition(t *testing.T) {
 	}
 
 	card := &Card{handle: scardHandle(1)}
-	if err := card.EndTransaction(ResetCard); err != nil {
+	if err := card.EndTransaction(DispositionResetCard); err != nil {
 		t.Fatalf("EndTransaction: %v", err)
 	}
-	if gotDisposition != scardDWORD(ResetCard) {
-		t.Fatalf("disposition = %d, want %d", gotDisposition, ResetCard)
+	if gotDisposition != scardDWORD(DispositionResetCard) {
+		t.Fatalf("disposition = %d, want %d", gotDisposition, DispositionResetCard)
 	}
 }
 
@@ -108,14 +196,14 @@ func TestReconnectUpdatesActiveProtocol(t *testing.T) {
 		initialization scardDWORD,
 		activeProtocol *scardDWORD,
 	) scardResult {
-		if shareMode != scardDWORD(ShareExclusive) {
-			t.Errorf("share mode = %d, want %d", shareMode, ShareExclusive)
+		if shareMode != scardDWORD(ShareModeExclusive) {
+			t.Errorf("share mode = %d, want %d", shareMode, ShareModeExclusive)
 		}
 		if preferredProtocols != scardDWORD(ProtocolT1) {
 			t.Errorf("preferred protocols = %d, want %d", preferredProtocols, ProtocolT1)
 		}
-		if initialization != scardDWORD(ResetCard) {
-			t.Errorf("initialization = %d, want %d", initialization, ResetCard)
+		if initialization != scardDWORD(DispositionResetCard) {
+			t.Errorf("initialization = %d, want %d", initialization, DispositionResetCard)
 		}
 
 		*activeProtocol = scardDWORD(ProtocolT1)
@@ -126,9 +214,9 @@ func TestReconnectUpdatesActiveProtocol(t *testing.T) {
 	card := &Card{handle: scardHandle(1), protocol: ProtocolT0}
 	protocol, err := card.Reconnect(
 		context.Background(),
-		ShareExclusive,
+		ShareModeExclusive,
 		ProtocolT1,
-		ResetCard,
+		DispositionResetCard,
 	)
 	if err != nil {
 		t.Fatalf("Reconnect: %v", err)
@@ -141,16 +229,53 @@ func TestReconnectUpdatesActiveProtocol(t *testing.T) {
 	}
 }
 
+func TestReconnectRejectsInvalidParametersBeforeNativeCall(t *testing.T) {
+	original := scardReconnect
+	t.Cleanup(func() { scardReconnect = original })
+
+	scardReconnect = func(
+		scardHandle,
+		scardDWORD,
+		scardDWORD,
+		scardDWORD,
+		*scardDWORD,
+	) scardResult {
+		t.Fatal("SCardReconnect was called with invalid parameters")
+		return 0
+	}
+
+	card := &Card{handle: scardHandle(1), protocol: ProtocolT0}
+	_, err := card.Reconnect(
+		context.Background(),
+		ShareMode(99),
+		ProtocolT1,
+		DispositionLeaveCard,
+	)
+	if !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("Reconnect error = %v, want ErrInvalidValue", err)
+	}
+
+	_, err = card.Reconnect(
+		context.Background(),
+		ShareModeShared,
+		ProtocolT1,
+		Disposition(99),
+	)
+	if !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("Reconnect error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func TestClosedCardRejectsLifecycleOperations(t *testing.T) {
 	card := &Card{closed: true}
 
 	if err := card.BeginTransaction(context.Background()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("BeginTransaction error = %v, want ErrClosed", err)
 	}
-	if err := card.EndTransaction(LeaveCard); !errors.Is(err, ErrClosed) {
+	if err := card.EndTransaction(DispositionLeaveCard); !errors.Is(err, ErrClosed) {
 		t.Fatalf("EndTransaction error = %v, want ErrClosed", err)
 	}
-	if _, err := card.Reconnect(context.Background(), ShareShared, ProtocolT1, LeaveCard); !errors.Is(err, ErrClosed) {
+	if _, err := card.Reconnect(context.Background(), ShareModeShared, ProtocolT1, DispositionLeaveCard); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Reconnect error = %v, want ErrClosed", err)
 	}
 }

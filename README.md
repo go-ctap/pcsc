@@ -64,7 +64,7 @@ for reader, err := range pcsc.Enumerate() {
 		log.Fatal(err)
 	}
 
-	log.Printf("reader=%q ATR=%x protocol=%d", status.ReaderName, status.ATR, status.Protocol)
+	log.Printf("readers=%q ATR=%x protocol=%d", status.ReaderNames, status.ATR, status.Protocol)
 
 	// SELECT the standard FIDO applet.
 	response, err := card.Transmit(ctx, []byte{
@@ -90,6 +90,10 @@ if err != nil {
 defer receiver.Close()
 
 for event := range receiver.Listen() {
+	if event.Err != nil {
+		log.Printf("PC/SC event receiver stopped: %v", event.Err)
+		continue
+	}
 	log.Printf("type=%s reader=%q", event.Type, event.ReaderInfo.Name)
 }
 ```
@@ -102,13 +106,20 @@ commands, but they do not provide rollback:
 if err := card.BeginTransaction(ctx); err != nil {
 	log.Fatal(err)
 }
-defer card.EndTransaction(pcsc.LeaveCard)
+defer card.EndTransaction(pcsc.DispositionLeaveCard)
 ```
 
-Canceling an in-flight contextual operation issues a best-effort `SCardCancel`
-for the card's PC/SC context and returns `ctx.Err()`.
-PC/SC implementations and reader drivers do not consistently guarantee that an
-in-flight operation can be interrupted, so it may continue after the Go method
-returns. The card remains serialized until the native call finishes. Do not
-automatically retry a canceled APDU or control request: the device may already
-have processed it.
+Canceling an in-flight contextual operation returns `ctx.Err()` promptly. On
+Windows the package also asks `SCardCancel` to interrupt the native call.
+pcsc-lite and Apple's PCSC framework only guarantee cancellation of
+`SCardGetStatusChange`, so APDU, control and transaction calls may continue
+after the Go method returns on those platforms. The card remains serialized
+until the native call finishes, and `Close` waits for it before releasing the
+native handles. Do not automatically retry a canceled APDU or control request:
+the device may already have processed it.
+
+`Control` requires the expected response-buffer size explicitly. Control
+requests are never retried automatically because they may have side effects.
+
+`CardStatus.ReaderNames` preserves the complete multi-string returned by
+`SCardStatus`.

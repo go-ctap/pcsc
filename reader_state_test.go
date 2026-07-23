@@ -1,13 +1,16 @@
+//go:build darwin || linux || windows
+
 package pcsc
 
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestNativeReaderStateLayoutRoundTrip(t *testing.T) {
 	layout := newNativeReaderStateLayout(scardReaderStateATRSize, scardReaderStatePacked)
-	states := []nativeReaderState{
+	states := []readerState{
 		{
 			name:         "reader",
 			currentState: ReaderStatePresent,
@@ -30,7 +33,7 @@ func TestNativeReaderStateLayoutRoundTrip(t *testing.T) {
 
 func TestNativeReaderStateLayoutDoesNotOverlapEntries(t *testing.T) {
 	layout := newNativeReaderStateLayout(scardReaderStateATRSize, scardReaderStatePacked)
-	states := []nativeReaderState{
+	states := []readerState{
 		{currentState: ReaderStatePresent, eventState: ReaderStatePresent, atr: []byte{1}},
 		{currentState: ReaderStateEmpty, eventState: ReaderStateEmpty, atr: []byte{2}},
 	}
@@ -41,5 +44,14 @@ func TestNativeReaderStateLayoutDoesNotOverlapEntries(t *testing.T) {
 	layout.decode(buffer, states)
 	if states[0].eventState != ReaderStatePresent || states[1].eventState != ReaderStateEmpty {
 		t.Fatalf("decoded states = %#v", states)
+	}
+}
+
+func TestDurationMillisecondsKeepsFiniteTimeoutFinite(t *testing.T) {
+	const infinite = ^uint32(0)
+
+	duration := time.Duration(infinite) * time.Millisecond
+	if got := durationMilliseconds(duration); got != infinite-1 {
+		t.Fatalf("durationMilliseconds(%s) = 0x%x, want 0x%x", duration, got, infinite-1)
 	}
 }

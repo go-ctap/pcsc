@@ -1,7 +1,7 @@
 package pcsc
 
-// ReaderInfo describes a PC/SC reader snapshot. Name is the stable identifier
-// accepted by Open.
+// ReaderInfo describes a PC/SC reader snapshot. Name is the reader name
+// accepted by Open for this snapshot.
 type ReaderInfo struct {
 	Name  string
 	State ReaderState
@@ -21,9 +21,9 @@ const (
 type ShareMode uint32
 
 const (
-	ShareExclusive ShareMode = 1
-	ShareShared    ShareMode = 2
-	ShareDirect    ShareMode = 3
+	ShareModeExclusive ShareMode = 1
+	ShareModeShared    ShareMode = 2
+	ShareModeDirect    ShareMode = 3
 )
 
 // Disposition controls what PC/SC does with a card when a connection or
@@ -31,10 +31,10 @@ const (
 type Disposition uint32
 
 const (
-	LeaveCard   Disposition = 0
-	ResetCard   Disposition = 1
-	UnpowerCard Disposition = 2
-	EjectCard   Disposition = 3
+	DispositionLeaveCard   Disposition = 0
+	DispositionResetCard   Disposition = 1
+	DispositionUnpowerCard Disposition = 2
+	DispositionEjectCard   Disposition = 3
 )
 
 // CardState is the state reported for an open card by SCardStatus. PC/SC uses
@@ -61,10 +61,25 @@ const (
 
 // CardStatus is a snapshot of a connected card.
 type CardStatus struct {
-	ReaderName string
-	State      CardState
-	Protocol   Protocol
-	ATR        []byte
+	// ReaderNames contains every reader name or alias returned by SCardStatus.
+	ReaderNames []string
+	State       CardState
+	Protocol    Protocol
+	ATR         []byte
+}
+
+func newCardStatus(
+	readerNames []string,
+	state CardState,
+	protocol Protocol,
+	atr []byte,
+) *CardStatus {
+	return &CardStatus{
+		ReaderNames: readerNames,
+		State:       state,
+		Protocol:    protocol,
+		ATR:         atr,
+	}
 }
 
 // Attribute identifies a PC/SC reader or card attribute.

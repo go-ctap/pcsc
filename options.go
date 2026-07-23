@@ -11,16 +11,16 @@ type openOptions struct {
 
 func newOpenOptions(opts ...OpenOption) openOptions {
 	options := openOptions{
-		shareMode:             ShareShared,
+		shareMode:             ShareModeShared,
 		preferredProtocols:    ProtocolT0 | ProtocolT1,
-		disconnectDisposition: LeaveCard,
+		disconnectDisposition: DispositionLeaveCard,
 	}
 
 	for _, option := range opts {
 		option(&options)
 	}
 
-	if options.shareMode == ShareDirect && !options.preferredProtocolsSet {
+	if options.shareMode == ShareModeDirect && !options.preferredProtocolsSet {
 		options.preferredProtocols = ProtocolUndefined
 	}
 

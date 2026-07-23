@@ -6,7 +6,9 @@ import "sync"
 type DeviceEvent struct {
 	Type       DeviceEventType
 	ReaderInfo *ReaderInfo
-	Err        error
+	// Err is non-nil when the receiver stops because its background PC/SC
+	// operation failed. Such an event is the final item from Listen.
+	Err error
 }
 
 type DeviceEventType string
@@ -28,7 +30,7 @@ type EventReceiver interface {
 // waits for a consumer to receive from Listen.
 type deviceEventQueue struct {
 	mu      sync.Mutex
-	pending []DeviceEvent
+	pending []queuedDeviceEvent
 	closed  bool
 
 	out     chan DeviceEvent
@@ -39,6 +41,11 @@ type deviceEventQueue struct {
 	closeOnce sync.Once
 }
 
+type queuedDeviceEvent struct {
+	event     DeviceEvent
+	delivered chan bool
+}
+
 func newDeviceEventQueue() *deviceEventQueue {
 	q := &deviceEventQueue{
 		out:     make(chan DeviceEvent),
@@ -47,19 +54,33 @@ func newDeviceEventQueue() *deviceEventQueue {
 		stopped: make(chan struct{}),
 	}
 	go q.run()
-
 	return q
 }
 
 // Send enqueues an event without waiting for a listener. It reports false once
 // closing has started; calls racing with Close are safe.
 func (q *deviceEventQueue) Send(event DeviceEvent) bool {
+	return q.send(queuedDeviceEvent{event: event})
+}
+
+// SendTerminal enqueues a final event and waits until it is delivered or the
+// queue is closed. Event receivers use it to make terminal errors observable
+// before closing Listen.
+func (q *deviceEventQueue) SendTerminal(event DeviceEvent) bool {
+	delivered := make(chan bool, 1)
+	if !q.send(queuedDeviceEvent{event: event, delivered: delivered}) {
+		return false
+	}
+
+	return <-delivered
+}
+
+func (q *deviceEventQueue) send(event queuedDeviceEvent) bool {
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
 		return false
 	}
-
 	q.pending = append(q.pending, event)
 	q.mu.Unlock()
 
@@ -81,9 +102,13 @@ func (q *deviceEventQueue) Close() {
 	q.closeOnce.Do(func() {
 		q.mu.Lock()
 		q.closed = true
+		pending := q.pending
 		q.pending = nil
 		q.mu.Unlock()
 
+		for _, event := range pending {
+			notifyDeviceEventDelivery(event, false)
+		}
 		close(q.done)
 		<-q.stopped
 	})
@@ -97,7 +122,6 @@ func (q *deviceEventQueue) run() {
 		q.mu.Lock()
 		if len(q.pending) == 0 {
 			q.mu.Unlock()
-
 			select {
 			case <-q.wake:
 				continue
@@ -107,7 +131,7 @@ func (q *deviceEventQueue) run() {
 		}
 
 		event := q.pending[0]
-		q.pending[0] = DeviceEvent{}
+		q.pending[0] = queuedDeviceEvent{}
 		if len(q.pending) == 1 {
 			q.pending = nil
 		} else {
@@ -116,9 +140,17 @@ func (q *deviceEventQueue) run() {
 		q.mu.Unlock()
 
 		select {
-		case q.out <- event:
+		case q.out <- event.event:
+			notifyDeviceEventDelivery(event, true)
 		case <-q.done:
+			notifyDeviceEventDelivery(event, false)
 			return
 		}
+	}
+}
+
+func notifyDeviceEventDelivery(event queuedDeviceEvent, delivered bool) {
+	if event.delivered != nil {
+		event.delivered <- delivered
 	}
 }

@@ -4,6 +4,7 @@ package pcsc
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -91,7 +92,7 @@ func loadNativeLibrary() error {
 	purego.RegisterLibFunc(&scardEndTransaction, lib, "SCardEndTransaction")
 	purego.RegisterLibFunc(&scardStatus, lib, "SCardStatus")
 	purego.RegisterLibFunc(&scardTransmit, lib, "SCardTransmit")
-	purego.RegisterLibFunc(&scardControl, lib, "SCardControl")
+	purego.RegisterLibFunc(&scardControl, lib, scardControlSymbol)
 	purego.RegisterLibFunc(&scardGetAttrib, lib, "SCardGetAttrib")
 	purego.RegisterLibFunc(&scardSetAttrib, lib, "SCardSetAttrib")
 	purego.RegisterLibFunc(&scardGetStatusChange, lib, "SCardGetStatusChange")
@@ -117,6 +118,13 @@ func releaseNativeContext(context scardContext) error {
 
 func cancelNativeContext(context scardContext) error {
 	return scardError("SCardCancel", scardCancel(context))
+}
+
+// pcsc-lite and Apple's PCSC framework only guarantee that SCardCancel
+// interrupts SCardGetStatusChange. Card operations therefore cannot be
+// canceled through the native API.
+func cancelNativeCardOperation(scardContext) error {
+	return nil
 }
 
 func listReadersNative(context scardContext) ([]string, error) {
@@ -145,7 +153,7 @@ func listReadersNative(context scardContext) ([]string, error) {
 	return parseMultiString(buffer[:min(int(size), len(buffer))]), nil
 }
 
-func getStatusChangeNative(context scardContext, timeout time.Duration, states []nativeReaderState) error {
+func getStatusChangeNative(context scardContext, timeout time.Duration, states []readerState) error {
 	names := make([][]byte, len(states))
 	namePointers := make([]uintptr, len(states))
 	for index, state := range states {
@@ -232,10 +240,10 @@ func Open(reader string, opts ...OpenOption) (*Card, error) {
 }
 
 func (card *Card) Status() (*CardStatus, error) {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	_ = card.lockOperation(context.Background())
+	defer card.unlockOperation()
 
-	if card.closed {
+	if card.isClosed() {
 		return nil, ErrClosed
 	}
 
@@ -262,14 +270,10 @@ func (card *Card) Status() (*CardStatus, error) {
 	if err := scardError("SCardStatus", code); err != nil {
 		return nil, err
 	}
-	if index := bytes.IndexByte(reader, 0); index >= 0 {
-		reader = reader[:index]
-	}
-
-	return &CardStatus{
-		ReaderName: string(reader),
-		State:      CardState(uint32(state)),
-		Protocol:   Protocol(uint32(protocol)),
-		ATR:        atr[:min(int(atrLen), len(atr))],
-	}, nil
+	return newCardStatus(
+		parseMultiString(reader),
+		CardState(uint32(state)),
+		Protocol(uint32(protocol)),
+		atr[:min(int(atrLen), len(atr))],
+	), nil
 }

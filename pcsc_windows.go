@@ -3,6 +3,7 @@
 package pcsc
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"time"
@@ -16,6 +17,8 @@ const (
 	scardScopeSystem        = 2
 	scardReaderStateATRSize = 36
 	scardReaderStatePacked  = false
+	reconnectSupportsDirect = false
+	reconnectSupportsEject  = false
 )
 
 type scardHandle = uintptr
@@ -70,6 +73,10 @@ var scardTransmit = func(
 
 var scardCancel = func(context scardContext) scardResult {
 	return scardResult(callCode(procSCardCancel, context))
+}
+
+var scardReleaseContext = func(context scardContext) scardResult {
+	return scardResult(callCode(procSCardReleaseContext, context))
 }
 
 var scardBeginTransaction = func(handle scardHandle) scardResult {
@@ -180,11 +187,15 @@ func establishNativeContext() (scardContext, error) {
 }
 
 func releaseNativeContext(context scardContext) error {
-	return pcscError("SCardReleaseContext", callCode(procSCardReleaseContext, context))
+	return pcscError("SCardReleaseContext", uint32(scardReleaseContext(context)))
 }
 
 func cancelNativeContext(context scardContext) error {
 	return pcscError("SCardCancel", uint32(scardCancel(context)))
+}
+
+func cancelNativeCardOperation(context scardContext) error {
+	return cancelNativeContext(context)
 }
 
 func listReadersNative(context scardContext) ([]string, error) {
@@ -215,7 +226,7 @@ func listReadersNative(context scardContext) ([]string, error) {
 	return parseUTF16MultiString(buffer[:min(int(size), len(buffer))]), nil
 }
 
-func getStatusChangeNative(context scardContext, timeout time.Duration, states []nativeReaderState) error {
+func getStatusChangeNative(context scardContext, timeout time.Duration, states []readerState) error {
 	names := make([][]uint16, len(states))
 	namePointers := make([]uintptr, len(states))
 	for index, state := range states {
@@ -307,10 +318,10 @@ func Open(reader string, opts ...OpenOption) (*Card, error) {
 }
 
 func (card *Card) Status() (*CardStatus, error) {
-	card.mu.Lock()
-	defer card.mu.Unlock()
+	_ = card.lockOperation(context.Background())
+	defer card.unlockOperation()
 
-	if card.closed {
+	if card.isClosed() {
 		return nil, ErrClosed
 	}
 
@@ -346,17 +357,10 @@ func (card *Card) Status() (*CardStatus, error) {
 	if err := pcscError("SCardStatusW", code); err != nil {
 		return nil, err
 	}
-	for index, character := range reader {
-		if character == 0 {
-			reader = reader[:index]
-			break
-		}
-	}
-
-	return &CardStatus{
-		ReaderName: string(utf16.Decode(reader)),
-		State:      CardState(state),
-		Protocol:   Protocol(protocol),
-		ATR:        atr[:min(int(atrLen), len(atr))],
-	}, nil
+	return newCardStatus(
+		parseUTF16MultiString(reader),
+		CardState(state),
+		Protocol(protocol),
+		atr[:min(int(atrLen), len(atr))],
+	), nil
 }

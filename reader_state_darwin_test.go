@@ -10,3 +10,9 @@ func TestDarwinReaderStateABI(t *testing.T) {
 		t.Fatalf("packed SCARD_READERSTATE stride = %d, want 61", layout.stride)
 	}
 }
+
+func TestDarwinUsesStandardSCardControlSymbol(t *testing.T) {
+	if scardControlSymbol != "SCardControl132" {
+		t.Fatalf("SCardControl symbol = %q, want SCardControl132", scardControlSymbol)
+	}
+}

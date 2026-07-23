@@ -4,24 +4,24 @@ import "testing"
 
 func TestOpenOptions(t *testing.T) {
 	options := newOpenOptions(
-		WithShareMode(ShareExclusive),
+		WithShareMode(ShareModeExclusive),
 		WithPreferredProtocols(ProtocolT1),
-		WithDisconnectDisposition(ResetCard),
+		WithDisconnectDisposition(DispositionResetCard),
 	)
 
-	if options.shareMode != ShareExclusive {
-		t.Fatalf("share mode = %d, want %d", options.shareMode, ShareExclusive)
+	if options.shareMode != ShareModeExclusive {
+		t.Fatalf("share mode = %d, want %d", options.shareMode, ShareModeExclusive)
 	}
 	if options.preferredProtocols != ProtocolT1 {
 		t.Fatalf("preferred protocols = %d, want %d", options.preferredProtocols, ProtocolT1)
 	}
-	if options.disconnectDisposition != ResetCard {
-		t.Fatalf("disconnect disposition = %d, want %d", options.disconnectDisposition, ResetCard)
+	if options.disconnectDisposition != DispositionResetCard {
+		t.Fatalf("disconnect disposition = %d, want %d", options.disconnectDisposition, DispositionResetCard)
 	}
 }
 
 func TestDirectOpenDefaultsToUndefinedProtocol(t *testing.T) {
-	options := newOpenOptions(WithShareMode(ShareDirect))
+	options := newOpenOptions(WithShareMode(ShareModeDirect))
 
 	if options.preferredProtocols != ProtocolUndefined {
 		t.Fatalf("preferred protocols = %d, want undefined", options.preferredProtocols)

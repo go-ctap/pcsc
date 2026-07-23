@@ -2,7 +2,12 @@
 
 package pcsc
 
-const ProtocolRaw Protocol = 0x00010000
+const (
+	ProtocolRaw     Protocol = 0x00010000
+	ProtocolDefault Protocol = 0x80000000
+	ProtocolOptimal Protocol = ProtocolUndefined
+	ProtocolTx      Protocol = ProtocolT0 | ProtocolT1
+)
 
 // Windows reports SCardStatus states as an enum rather than the bitmask used
 // by pcsc-lite.

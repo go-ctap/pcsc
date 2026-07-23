@@ -2,7 +2,10 @@
 
 package pcsc
 
-const ProtocolRaw Protocol = 0x0004
+const (
+	ProtocolRaw Protocol = 0x0004
+	ProtocolAny Protocol = ProtocolT0 | ProtocolT1
+)
 
 // pcsc-lite and Apple's PCSC framework report SCardStatus states as a bitmask.
 const (
